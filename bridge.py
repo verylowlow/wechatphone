@@ -1,0 +1,717 @@
+# -*- coding: utf-8 -*-
+"""
+wechatphone - 微信语音电话 AI 桥接 (最小闭环)
+
+音频链路 (单条 VB-Cable, 物理隔离回声):
+  微信对方声音 -> 微信扬声器(物理扬声器) --loopback捕获--> 本程序 --> 阿里云 Realtime
+  阿里云 AI 语音 --> 本程序 --写入--> CABLE Input ==> CABLE Output --> 微信麦克风 --> 对方
+
+  回声隔离原理: AI 声音只进 CABLE, 永远不上物理扬声器, 因此 loopback 捕获不到 AI 自己的声音。
+
+微信端设置:
+  麦克风 = CABLE Output (VB-Audio Virtual Cable)
+  扬声器 = 本机扬声器 (物理设备, 你自己也能听到对方)
+
+用法:
+  python bridge.py --list                 # 列出所有音频设备
+  python bridge.py                        # 自动识别设备并启动
+  python bridge.py --capture-idx 16 --inject-idx 13   # 手动指定
+"""
+import argparse
+import asyncio
+import base64
+import json
+import os
+import queue
+import sys
+import threading
+import time
+
+import numpy as np
+try:
+    import pyaudiowpatch as pyaudio  # 原生支持 WASAPI loopback
+    _PW = True
+except Exception:
+    import pyaudio
+    _PW = False
+import websockets
+
+# ---------------- 配置 ----------------
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+_load_dotenv()
+
+API_KEY = os.environ.get("ALIYUN_REALTIME_API_KEY", "")
+BASE_URL = os.environ.get(
+    "ALIYUN_REALTIME_BASE_URL",
+    "https://llm-eef79bxxd42lvkdz.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+)
+MODEL = os.environ.get("ALIYUN_REALTIME_MODEL", "qwen-audio-3.0-realtime-plus")
+VOICE = os.environ.get("ALIYUN_REALTIME_VOICE", "longanqian")
+# 交互模式: server_vad(官方demo默认,参数可控,诊断友好) | smart_turn(语义轮次,过滤嗯啊)
+TURN_DETECTION = os.environ.get("ALIYUN_TURN_DETECTION", "server_vad")
+VAD_THRESHOLD = float(os.environ.get("ALIYUN_VAD_THRESHOLD", "0.5"))        # [-1.0, 1.0]
+SILENCE_MS = int(os.environ.get("ALIYUN_SILENCE_DURATION_MS", "800"))     # [200, 6000], 对话推荐400-800
+# 噪声门(官方demo同款): 平均振幅低于该值的音频块直接丢弃, 防止环境噪声让VAD常开
+NOISE_GATE = int(os.environ.get("ALIYUN_NOISE_GATE", "500"))
+
+# 采样率: 捕获端跟随 loopback 设备原生采样率, 上行重采样到 16k; 下行 API 24k -> 注入设备原生采样率
+CAPTURE_RATE_FALLBACK = 48000
+UP_RATE = 16000      # 上行给 API
+DOWN_API_RATE = 24000  # API 返回
+INJECT_RATE_FALLBACK = 48000  # CABLE Input 原生采样率
+
+CHUNK = 960          # ~20ms @48k
+PLAY_QUEUE_MAX = 300 # ~6s @20ms 缓冲上限
+
+INSTRUCTIONS = (
+    "你是一位自然的中文电话语音助手。用户正在和你打电话。"
+    "用简短、口语化的中文回答,像真人聊天一样,不要长篇大论。"
+    "每次回复尽量控制在一两句话以内。"
+)
+
+
+def build_ws_url(base_url: str, model: str) -> str:
+    """复用 newcallcall 的 URL 构造逻辑: scheme -> wss, path -> /api-ws/v1/realtime"""
+    from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+    u = urlparse(base_url)
+    scheme = "wss" if u.scheme in ("https", "http") else u.scheme
+    q = dict(parse_qsl(u.query))
+    q["model"] = model
+    return urlunparse((scheme, u.netloc, "/api-ws/v1/realtime", "", urlencode(q), ""))
+
+
+# ---------------- 音频重采样 ----------------
+def resample_linear(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """简单线性插值重采样, 足够实时语音用 (原型阶段)"""
+    if src_rate == dst_rate or len(pcm) == 0:
+        return pcm
+    duration = len(pcm) / src_rate
+    dst_len = max(1, int(round(duration * dst_rate)))
+    x_old = np.linspace(0, duration, num=len(pcm), endpoint=False)
+    x_new = np.linspace(0, duration, num=dst_len, endpoint=False)
+    return np.interp(x_new, x_old, pcm).astype(np.int16)
+
+
+# ---------------- 设备枚举 ----------------
+def _wasapi_index(pa):
+    return pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+
+
+def list_devices(pa: pyaudio.PyAudio):
+    wasapi_idx = _wasapi_index(pa)
+    print("\n=== 音频设备列表 (WASAPI) ===")
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if d["hostApi"] != wasapi_idx:
+            continue
+        kind = []
+        if d["maxInputChannels"] > 0:
+            kind.append("IN ")
+        if d["maxOutputChannels"] > 0:
+            kind.append("OUT")
+        print(f"  [{i:2d}] {'/'.join(kind):8s} {int(d['defaultSampleRate']):6d}Hz  {d['name']}")
+    print("提示: 捕获用 [Loopback] 设备(物理扬声器的伴侣); 注入用 CABLE Input(输出端), 微信麦克风选 CABLE Output")
+
+
+def find_wasapi_device(pa, keyword, want_output):
+    """只在 WASAPI 设备里按关键词查找. want_output=True 找输出设备, False 找输入设备."""
+    wasapi_idx = _wasapi_index(pa)
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if d["hostApi"] != wasapi_idx:
+            continue
+        if keyword.lower() not in d["name"].lower():
+            continue
+        if want_output and d["maxOutputChannels"] > 0:
+            return i
+        if not want_output and d["maxInputChannels"] > 0:
+            return i
+    return None
+
+
+def find_loopback_of(pa, output_idx):
+    """找到某个输出设备对应的 [Loopback] 输入设备 (pyaudiowpatch 提供)."""
+    out_name = pa.get_device_info_by_index(output_idx)["name"]
+    wasapi_idx = _wasapi_index(pa)
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if (d["hostApi"] == wasapi_idx and d["maxInputChannels"] > 0
+                and "Loopback" in d["name"] and out_name in d["name"]):
+            return i
+    return None
+
+
+def find_source_output_of_loopback(pa, loopback_idx):
+    """loopback 设备名形如 'XXX [Loopback]', 找到名字去掉 [Loopback] 后缀的源输出设备."""
+    lb_name = pa.get_device_info_by_index(loopback_idx)["name"]
+    base = lb_name.replace(" [Loopback]", "").replace("[Loopback]", "").strip()
+    wasapi_idx = _wasapi_index(pa)
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        if (d["hostApi"] == wasapi_idx and d["maxOutputChannels"] > 0
+                and d["name"].strip() == base):
+            return i
+    return None
+
+
+# ---------------- 静音保活线程 (防止 loopback 在扬声器空闲时阻塞) ----------------
+class KeepAliveThread(threading.Thread):
+    """WASAPI loopback 在输出设备完全空闲(无任何渲染流)时 read() 会阻塞不吐数据。
+    通话中对方一旦停顿, 捕获就会卡死, VAD 收不到静音, AI 永远不回复。
+    解法: 向 loopback 对应的物理扬声器持续写静音帧, 保持渲染会话活跃,
+    loopback 即可持续吐数据(静音+真实声音); 静音本身听不见。"""
+    def __init__(self, pa, output_idx, stop_event):
+        super().__init__(daemon=True)
+        self.pa = pa
+        self.output_idx = output_idx
+        self.stop_event = stop_event
+
+    def run(self):
+        dev = self.pa.get_device_info_by_index(self.output_idx)
+        rate = int(dev["defaultSampleRate"])
+        max_ch = int(dev["maxOutputChannels"]) or 2
+        # 探测可用的 (声道数, 采样率) 组合: 该设备可能要求特定声道数(如4ch)
+        stream = None
+        channels = 0
+        for ch in sorted({max_ch, 4, 2, 1}, reverse=True):
+            if ch > max_ch:
+                continue
+            for r in sorted({rate, 48000, 44100}, reverse=True):
+                try:
+                    stream = self.pa.open(
+                        format=pyaudio.paInt16,
+                        channels=ch,
+                        rate=r,
+                        output=True,
+                        output_device_index=self.output_idx,
+                        frames_per_buffer=CHUNK,
+                    )
+                    channels = ch
+                    rate = r
+                    break
+                except Exception:
+                    stream = None
+                    continue
+            if stream is not None:
+                break
+        if stream is None:
+            print(f"[KEEPALIVE] 打开失败(不影响主流程)", flush=True)
+            return
+        silence = b"\x00" * (CHUNK * 2 * channels)
+        print(f"[KEEPALIVE] 静音保活启动: {dev['name']} @ {rate}Hz ch={channels}", flush=True)
+        while not self.stop_event.is_set():
+            try:
+                stream.write(silence)
+            except Exception:
+                break
+        stream.stop_stream()
+        stream.close()
+
+
+# ---------------- 捕获线程 (loopback) ----------------
+class CaptureThread(threading.Thread):
+    def __init__(self, pa, device_idx, out_queue, stop_event):
+        super().__init__(daemon=True)
+        self.pa = pa
+        self.device_idx = device_idx
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+        self.native_rate = CAPTURE_RATE_FALLBACK
+
+    def run(self):
+        dev = self.pa.get_device_info_by_index(self.device_idx)
+        self.native_rate = int(dev["defaultSampleRate"])
+        # 选中的就是 [Loopback] 输入设备, 直接当 input 打开
+        channels = int(dev["maxInputChannels"]) or 2
+        try:
+            stream = self.pa.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=self.native_rate,
+                input=True,
+                input_device_index=self.device_idx,
+                frames_per_buffer=CHUNK,
+            )
+        except Exception as e:
+            print(f"[CAPTURE] 打开失败: {e}", flush=True)
+            return
+        print(f"[CAPTURE] 启动: {dev['name']} @ {self.native_rate}Hz ch={channels}", flush=True)
+        last_level_time = time.time()
+        level_acc = []
+        while not self.stop_event.is_set():
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+            except Exception:
+                continue
+            pcm = np.frombuffer(data, dtype=np.int16)
+            # 每秒打印一次 RMS 电平, 便于判断捕获的是人声还是噪声/静音
+            level_acc.append(float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))))
+            now = time.time()
+            if now - last_level_time >= 1.0:
+                rms = sum(level_acc) / len(level_acc)
+                bar = "#" * min(40, int(rms / 200))
+                print(f"[电平] RMS={rms:8.0f} {bar}", flush=True)
+                level_acc = []
+                last_level_time = now
+            if channels > 1:
+                pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+            try:
+                self.out_queue.put_nowait(pcm.tobytes())
+            except queue.Full:
+                pass
+        stream.stop_stream()
+        stream.close()
+        print("[CAPTURE] 停止", flush=True)
+
+
+# ---------------- 播放/注入线程 (写入 CABLE Input -> 微信从 CABLE Output 读取) ----------------
+class PlayThread(threading.Thread):
+    def __init__(self, pa, device_idx, in_queue, stop_event):
+        super().__init__(daemon=True)
+        self.pa = pa
+        self.device_idx = device_idx
+        self.in_queue = in_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        dev = self.pa.get_device_info_by_index(self.device_idx)
+        rate = int(dev["defaultSampleRate"]) or INJECT_RATE_FALLBACK
+        # CABLE Output 是麦克风设备(maxOutputChannels=0), 尝试用2声道, 失败退回1声道
+        stream = None
+        channels = 2
+        for ch in (2, 1):
+            try:
+                stream = self.pa.open(
+                    format=pyaudio.paInt16,
+                    channels=ch,
+                    rate=rate,
+                    output=True,
+                    output_device_index=self.device_idx,
+                    frames_per_buffer=CHUNK,
+                )
+                channels = ch
+                break
+            except Exception:
+                stream = None
+                continue
+        if stream is None:
+            print(f"[PLAY] 打开失败 (设备可能不支持作为输出)", flush=True)
+            return
+        self.rate = rate
+        self.channels = channels
+        print(f"[PLAY] 启动: {dev['name']} @ {rate}Hz ch={channels}", flush=True)
+        silence = b"\x00" * (CHUNK * 2 * channels)
+        while not self.stop_event.is_set():
+            try:
+                data = self.in_queue.get(timeout=0.05)
+            except queue.Empty:
+                data = silence
+            if channels == 2:
+                pcm = np.frombuffer(data, dtype=np.int16)
+                stereo = np.empty(len(pcm) * 2, dtype=np.int16)
+                stereo[0::2] = pcm
+                stereo[1::2] = pcm
+                data = stereo.tobytes()
+            try:
+                stream.write(data)
+            except Exception:
+                pass
+        stream.stop_stream()
+        stream.close()
+        print("[PLAY] 停止", flush=True)
+
+
+# ---------------- 阿里云 Realtime 客户端 ----------------
+class AliyunRealtime:
+    def __init__(self, up_queue, down_queue, stop_event):
+        self.up_queue = up_queue      # bytes (native capture rate pcm16 mono)
+        self.down_queue = down_queue  # bytes (inject rate pcm16 mono)
+        self.stop_event = stop_event
+        self.ws = None
+        self.capture_rate = CAPTURE_RATE_FALLBACK
+        self.play_rate = INJECT_RATE_FALLBACK
+        # 服务端是否正在生成回复 (噪声门/打断判断用)
+        self.is_responding = False
+        # 打断后抑制残余音频, 直到下一个 response.created
+        self.audio_suppressed = False
+
+    async def run(self):
+        url = build_ws_url(BASE_URL, MODEL)
+        print(f"[WS] 连接: {url}", flush=True)
+        async with websockets.connect(
+            url,
+            additional_headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "x-dashscope-dataInspection": "disable",
+            },
+            open_timeout=15,
+            ping_interval=15,
+            ping_timeout=10,
+            max_size=8 * 1024 * 1024,
+        ) as ws:
+            self.ws = ws
+            print("[WS] 已连接", flush=True)
+            await self._configure_session()
+            sender = asyncio.create_task(self._send_loop())
+            receiver = asyncio.create_task(self._recv_loop())
+            stopper = asyncio.create_task(self._watch_stop())
+            done, pending = await asyncio.wait(
+                {sender, receiver, stopper}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+
+    async def _configure_session(self):
+        # 严格按官方文档: turn_detection 支持 server_vad / smart_turn / null(push-to-talk)
+        # 注意: Qwen-Audio 的 session.update 没有 input_audio_transcription 字段,
+        #       转写事件服务端默认推送, 无需配置
+        if TURN_DETECTION == "server_vad":
+            td = {
+                "type": "server_vad",
+                "threshold": VAD_THRESHOLD,          # [-1.0,1.0] 默认0.5
+                "silence_duration_ms": SILENCE_MS,   # [200,6000] 对话推荐400-800
+            }
+        elif TURN_DETECTION == "push_to_talk":
+            td = None
+        else:
+            td = {"type": "smart_turn"}
+        await self.ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "voice": VOICE,
+                "instructions": INSTRUCTIONS,
+                "input_audio_format": "pcm",   # 16kHz 16bit 单声道
+                "output_audio_format": "pcm",  # 24kHz 16bit 单声道
+                "turn_detection": td,
+                "max_history_turns": 20,
+            },
+        }, ensure_ascii=False))
+        print(f"[WS] 已发送 session.update (mode={TURN_DETECTION}, noise_gate={NOISE_GATE})", flush=True)
+        # 等 session.updated
+        while True:
+            msg = json.loads(await self.ws.recv())
+            t = msg.get("type")
+            if t == "session.updated":
+                print("[WS] session 就绪", flush=True)
+                break
+            if t == "error":
+                raise RuntimeError(f"session.update 失败: {msg}")
+
+    async def _send_loop(self):
+        """从捕获队列取音频 -> 重采样到16k -> 攒成~100ms -> base64 append
+
+        噪声门(官方demo同款, 仅在AI说话期间生效): AI 播放时只放行高能量音频,
+        防止环境噪声误触发打断; 空闲时发送全部音频(含静音),
+        让服务端 VAD 能收到静音从而判定"用户说完", 触发回复。
+        """
+        send_buf = bytearray()
+        # 官方建议每次发送 ~100ms 音频: 16kHz*2bytes*0.1s = 3200 bytes
+        TARGET = 3200
+        loop = asyncio.get_event_loop()
+        while not self.stop_event.is_set():
+            try:
+                chunk = await loop.run_in_executor(None, self.up_queue.get, True, 0.1)
+            except queue.Empty:
+                # 队列空时把缓冲里剩余的音频发出去, 避免尾部音频丢失
+                if send_buf:
+                    b64 = base64.b64encode(bytes(send_buf)).decode("ascii")
+                    await self.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+                    send_buf.clear()
+                continue
+            pcm = np.frombuffer(chunk, dtype=np.int16)
+            # 噪声门仅在 AI 正在响应/播放时启用(官方 demo 行为)
+            ai_active = self.is_responding or self.down_queue.qsize() > 0
+            if ai_active and float(np.abs(pcm).mean()) < NOISE_GATE:
+                continue
+            pcm16k = resample_linear(pcm, self.capture_rate, UP_RATE)
+            send_buf.extend(pcm16k.tobytes())
+            if len(send_buf) >= TARGET:
+                b64 = base64.b64encode(bytes(send_buf)).decode("ascii")
+                await self.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+                send_buf.clear()
+
+    async def _recv_loop(self):
+        """收 API 事件: response.audio.delta -> 重采样 -> 播放队列; 其余事件打印用于诊断。
+        事件语义按官方文档对齐:
+          speech_started -> 打断: 清空播放缓冲 + 抑制残余音频
+          response.created -> is_responding=True, 解除抑制
+          response.done -> is_responding=False (status 可能为 cancelled)
+        """
+        async for raw in self.ws:
+            if self.stop_event.is_set():
+                break
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            t = msg.get("type", "")
+            if t == "response.audio.delta":
+                if self.audio_suppressed:
+                    continue  # 已被打断, 丢弃残余音频
+                pcm = np.frombuffer(base64.b64decode(msg["delta"]), dtype=np.int16)
+                pcm_out = resample_linear(pcm, DOWN_API_RATE, self.play_rate)
+                if self.down_queue.qsize() < PLAY_QUEUE_MAX:
+                    self.down_queue.put_nowait(pcm_out.tobytes())
+            elif t == "input_audio_buffer.speech_started":
+                # 官方打断处理: 清空播放缓冲 + 抑制后续残余音频
+                self.audio_suppressed = True
+                while not self.down_queue.empty():
+                    try:
+                        self.down_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                print("[WS] 检测到说话(speech_started)", flush=True)
+            elif t == "input_audio_buffer.speech_stopped":
+                reason = msg.get("reason", "")
+                print(f"[WS] 检测到停止(speech_stopped{' reason='+reason if reason else ''})", flush=True)
+            elif t == "input_audio_buffer.committed":
+                print("[WS] 音频缓冲已提交(committed)", flush=True)
+            elif t == "conversation.item.input_audio_transcription.delta":
+                print(f"⟨{msg.get('delta','')}⟩", end="", flush=True)
+            elif t == "conversation.item.input_audio_transcription.completed":
+                print(f"\n[对方说] {msg.get('transcript','').strip()}", flush=True)
+            elif t == "conversation.item.ambient_audio_transcription.completed":
+                print(f"[环境音] {msg.get('text','').strip()}", flush=True)
+            elif t == "response.created":
+                self.is_responding = True
+                self.audio_suppressed = False
+                print("[WS] 开始生成回复(response.created)", flush=True)
+            elif t == "response.audio_transcript.delta":
+                print(msg.get("delta", ""), end="", flush=True)
+            elif t == "response.audio_transcript.done":
+                print(flush=True)
+            elif t == "response.done":
+                self.is_responding = False
+                resp = msg.get("response", {})
+                print(f"[WS] 回复完成(response.done, status={resp.get('status','')})", flush=True)
+            elif t == "error":
+                print(f"[WS] 错误: {msg}", flush=True)
+
+    async def _watch_stop(self):
+        while not self.stop_event.is_set():
+            await asyncio.sleep(0.2)
+
+
+def ws_thread_entry(up_queue, down_queue, stop_event, capture_rate_holder, play_rate_holder):
+    client = AliyunRealtime(up_queue, down_queue, stop_event)
+    # 等捕获线程确定 native rate
+    for _ in range(50):
+        if capture_rate_holder.get("rate"):
+            client.capture_rate = capture_rate_holder["rate"]
+            break
+        time.sleep(0.1)
+    for _ in range(50):
+        if play_rate_holder.get("rate"):
+            client.play_rate = play_rate_holder["rate"]
+            break
+        time.sleep(0.1)
+    try:
+        asyncio.run(client.run())
+    except Exception as e:
+        print(f"[WS] 异常退出: {e}", flush=True)
+        stop_event.set()
+
+
+# ---------------- 系统默认麦克风切换 (微信无持久设备设置, 跟随系统默认麦克风) ----------------
+class DefaultMicSwitch:
+    """启动时: 把系统默认麦克风切到 CABLE Output, 微信发起通话即自动使用;
+    退出时: 还原原默认麦克风。"""
+
+    def __init__(self):
+        self.active = False
+        self.prev_mic_id = None
+        self._com_inited = False
+
+    def activate(self):
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            import comtypes
+            try:
+                comtypes.CoInitialize()
+                self._com_inited = True
+            except Exception:
+                pass  # 已初始化过
+            from pycaw.pycaw import AudioUtilities, ERole
+
+            # 1. 找 CABLE Output (capture 端点, id 以 {0.0.1. 开头)
+            target = None
+            for d in AudioUtilities.GetAllDevices():
+                name = d.FriendlyName or ""
+                if "CABLE Output" in name and d.id.startswith("{0.0.1."):
+                    target = d
+                    break
+            if target is None:
+                print("[默认设备] 未找到 CABLE Output, 跳过切换 (需在通话中手动选麦克风)", flush=True)
+                return False
+
+            # 2. 记录当前默认麦克风 (eCommunications 角色, 微信跟随它), 用于退出还原
+            try:
+                prev = AudioUtilities.GetMicrophone()
+                self.prev_mic_id = str(prev.GetId())
+            except Exception:
+                self.prev_mic_id = None
+            if self.prev_mic_id == target.id:
+                self.prev_mic_id = None  # 本来就是 CABLE Output, 退出时不还原
+                self.active = True
+                print("[默认设备] 默认麦克风已是 CABLE Output", flush=True)
+                return True
+
+            # 3. 设为默认 (Console + Communications 双角色, 微信走 Communications)
+            AudioUtilities.SetDefaultDevice(
+                target.id, roles=[ERole.eConsole, ERole.eCommunications]
+            )
+            self.active = True
+            print("[默认设备] 系统默认麦克风 -> CABLE Output (微信通话将自动使用)", flush=True)
+            return True
+        except Exception as e:
+            print(f"[默认设备] 切换失败: {e} (可在通话窗口手动选麦克风)", flush=True)
+            return False
+
+    def restore(self):
+        if not self.active or self.prev_mic_id is None:
+            return
+        try:
+            from pycaw.pycaw import AudioUtilities, ERole
+            AudioUtilities.SetDefaultDevice(
+                self.prev_mic_id, roles=[ERole.eConsole, ERole.eCommunications]
+            )
+            print("[默认设备] 已还原系统默认麦克风", flush=True)
+        except Exception as e:
+            print(f"[默认设备] 还原失败: {e}", flush=True)
+
+
+# ---------------- main ----------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list", action="store_true", help="列出音频设备后退出")
+    ap.add_argument("--capture-idx", type=int, default=None,
+                    help="捕获设备索引 (某个输出设备的 [Loopback] 伴侣)")
+    ap.add_argument("--inject-idx", type=int, default=None,
+                    help="注入设备索引 (CABLE Input, 作为输出写入)")
+    ap.add_argument("--no-default-mic", action="store_true",
+                    help="不自动切换系统默认麦克风 (默认会自动切到 CABLE Output)")
+    args = ap.parse_args()
+
+    if not API_KEY:
+        print("错误: 未配置 ALIYUN_REALTIME_API_KEY (检查 .env)")
+        sys.exit(1)
+
+    pa = pyaudio.PyAudio()
+    list_devices(pa)
+
+    if args.list:
+        pa.terminate()
+        return
+
+    wasapi_idx = _wasapi_index(pa)
+
+    # ---- 捕获设备: 微信扬声器(物理设备) 的 loopback ----
+    # 注意: 必须选【物理】输出设备的 loopback, 绝不能选 CABLE 的 loopback,
+    #       否则 AI 注入 CABLE Input 的声音会被重新捕获, 形成自激回声。
+    capture_idx = args.capture_idx
+    if capture_idx is None:
+        # 优先: 系统默认输出设备的 loopback (前提: 它不是 CABLE)
+        try:
+            default_out = pa.get_default_output_device_info()
+            if "CABLE" not in default_out["name"]:
+                capture_idx = find_loopback_of(pa, default_out["index"])
+                if capture_idx is not None:
+                    print(f"\n自动选中捕获设备 [{capture_idx}] (默认输出 '{default_out['name']}' 的 loopback)")
+        except Exception:
+            capture_idx = None
+        if capture_idx is None:
+            # 回退: 找第一个【物理非 CABLE】输出设备的 loopback
+            for i in range(pa.get_device_count()):
+                d = pa.get_device_info_by_index(i)
+                if (d["hostApi"] == wasapi_idx and d["maxOutputChannels"] > 0
+                        and "CABLE" not in d["name"]):
+                    lb = find_loopback_of(pa, i)
+                    if lb is not None:
+                        capture_idx = lb
+                        print(f"\n自动选中捕获设备 [{capture_idx}] ('{d['name']}' 的 loopback)")
+                        break
+        if capture_idx is None:
+            capture_idx = int(input("\n输入捕获设备索引 ([Loopback] 设备, 须为物理扬声器): ").strip())
+
+    # ---- 注入设备: CABLE Input (输出端) ----
+    inject_idx = args.inject_idx
+    if inject_idx is None:
+        inject_idx = find_wasapi_device(pa, "CABLE Input", want_output=True)
+        if inject_idx is not None:
+            print(f"自动选中注入设备 [{inject_idx}] {pa.get_device_info_by_index(inject_idx)['name']}")
+        else:
+            inject_idx = int(input("输入注入设备索引 (CABLE Input): ").strip())
+
+    up_q = queue.Queue(maxsize=500)
+    down_q = queue.Queue(maxsize=PLAY_QUEUE_MAX)
+    stop_event = threading.Event()
+
+    # 自动切换系统默认麦克风 -> CABLE Output (微信无持久设备设置, 跟随系统默认)
+    mic_switch = DefaultMicSwitch()
+    if not args.no_default_mic:
+        mic_switch.activate()
+
+    # 静音保活: 防止 loopback 在扬声器空闲时阻塞 (通话中对方停顿的致命场景)
+    src_out = find_source_output_of_loopback(pa, capture_idx)
+    if src_out is not None:
+        keepalive = KeepAliveThread(pa, src_out, stop_event)
+        keepalive.start()
+    else:
+        print("[MAIN] 警告: 未找到 loopback 的源输出设备, 无法启用静音保活", flush=True)
+
+    cap = CaptureThread(pa, capture_idx, up_q, stop_event)
+    cap.start()
+    rate_holder = {}
+    for _ in range(50):
+        if cap.native_rate and cap.is_alive():
+            rate_holder["rate"] = cap.native_rate
+            break
+        time.sleep(0.1)
+    if "rate" not in rate_holder:
+        rate_holder["rate"] = CAPTURE_RATE_FALLBACK
+
+    play = PlayThread(pa, inject_idx, down_q, stop_event)
+    play.start()
+    play_rate_holder = {"rate": INJECT_RATE_FALLBACK}
+    for _ in range(50):
+        if getattr(play, "rate", None):
+            play_rate_holder["rate"] = play.rate
+            break
+        time.sleep(0.1)
+
+    ws_t = threading.Thread(
+        target=ws_thread_entry, args=(up_q, down_q, stop_event, rate_holder, play_rate_holder), daemon=True
+    )
+    ws_t.start()
+
+    print("\n=== 桥接已启动, 按 Ctrl+C 退出 ===\n")
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.5)
+            if not ws_t.is_alive():
+                print("[MAIN] WS 线程已退出")
+                break
+    except KeyboardInterrupt:
+        print("\n退出中...")
+    finally:
+        stop_event.set()
+        mic_switch.restore()
+        time.sleep(0.3)
+        pa.terminate()
+
+
+if __name__ == "__main__":
+    main()
