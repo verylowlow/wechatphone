@@ -1,0 +1,15 @@
+pyaudiowpatch>=0.2.12.8
+numpy
+websockets
+pycaw
+comtypes
+flask
+requests
+pypdf
+python-docx
+jieba
+pywinauto
+pyautogui
+pyperclip
+pillow
+opencv-python-headless

@@ -65,6 +65,106 @@ SILENCE_MS = int(os.environ.get("ALIYUN_SILENCE_DURATION_MS", "800"))     # [200
 # 噪声门(官方demo同款): 平均振幅低于该值的音频块直接丢弃, 防止环境噪声让VAD常开
 NOISE_GATE = int(os.environ.get("ALIYUN_NOISE_GATE", "500"))
 
+# ---------------- 知识库 ----------------
+# KNOWLEDGE_ENABLED=0 可整体关闭; KNOWLEDGE_BACKEND=local (SQLite+numpy 嵌入式混合检索)
+KNOWLEDGE_ENABLED = os.environ.get("KNOWLEDGE_ENABLED", "1").strip() not in ("0", "false", "no")
+
+# ---------------- 通话记录 ----------------
+# CALLLOG_ENABLED=0 可关闭; 数据落在 data/calls.sqlite, 查看: python calllog_app.py
+CALLLOG_ENABLED = os.environ.get("CALLLOG_ENABLED", "1").strip() not in ("0", "false", "no")
+# 外呼(autodial)开场: 任务注入后多少秒无人出声, 就让 AI 先开口(播种一条用户文本触发回复)
+OUTBOUND_OPEN_DELAY = float(os.environ.get("OUTBOUND_OPEN_DELAY", "5"))
+# 来电自动接听: AUTO_ANSWER=1 开启; AUTO_ANSWER_VIDEO=1 时连视频通话也接(默认只接语音)
+AUTO_ANSWER = os.environ.get("AUTO_ANSWER", "1").strip() not in ("0", "false", "no")
+AUTO_ANSWER_VIDEO = os.environ.get("AUTO_ANSWER_VIDEO", "0").strip() in ("1", "true", "yes")
+AUTO_ANSWER_POLL = float(os.environ.get("AUTO_ANSWER_POLL", "1.0"))
+# 来电监听线程 <-> WS 客户端 的线程间共享状态:
+#   answer_seed_at: 非 None 且到期时, 播种让 AI 对来电先开口
+_shared = {"answer_seed_at": None, "answer_caller": "对方"}
+_incoming_watcher = None
+
+
+def _hangup_drain(down_queue, max_wait: float = 15.0) -> None:
+    """同步等待播放队列清空 (farewell 完整注入微信), 供 asyncio executor 调用。"""
+    try:
+        from autodial.hangup import wait_audio_drain
+        wait_audio_drain(down_queue, max_wait)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HANGUP] drain 异常(忽略): {e}", flush=True)
+
+
+def _hangup_click() -> dict:
+    """同步点击挂断按钮, 供 asyncio executor 调用。pywinauto 缺失时降级返回。"""
+    try:
+        from autodial.hangup import hang_up
+        return hang_up()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "method": f"unavailable: {e}"}
+_call_recorder = None
+if CALLLOG_ENABLED:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from calllog.recorder import CallRecorder
+        from autodial.taskfile import clear_current_task
+        _call_recorder = CallRecorder(on_call_closed=clear_current_task)
+        print("[CALLLOG] 通话记录已启用 (data/calls.sqlite)", flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[CALLLOG] 通话记录初始化失败, 本次不记录: {_e}", flush=True)
+        _call_recorder = None
+_kb = None
+if KNOWLEDGE_ENABLED:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from knowledge import create_knowledge
+        _kb = create_knowledge()
+        _stats = _kb.get_stats()
+        print(f"[KB] 知识库已加载: backend={_stats['backend']}, docs={_stats['documents']}, "
+              f"chunks={_stats['chunks']}, embedding={_stats['embedding']}", flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[KB] 知识库加载失败, 本次通话不启用知识库: {_e}", flush=True)
+        _kb = None
+
+# search_knowledge 工具 (Qwen Realtime function calling, OpenAI 兼容格式)
+SEARCH_KNOWLEDGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_knowledge",
+        "description": (
+            "搜索本地知识库(业务资料/FAQ/产品说明)。"
+            "当对方问到你不确定的业务信息(价格、政策、流程、产品信息)时调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词或问题"},
+                "top_k": {"type": "integer", "description": "返回条数(默认5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+# hang_up 工具: AI 识别到对方明确挂断意图时调用, 先道别再挂断
+HANG_UP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "hang_up",
+        "description": (
+            "挂断当前语音通话。仅当对方明确表示要结束通话时调用"
+            "(如: '先这样吧'、'挂了'、'拜拜'、'没事了再见')。"
+            "调用之后, 系统会自动挂断电话, 请在收到工具结果后立即用一句简短口语化的话礼貌道别。"
+            "对方只是沉默或犹豫时不要调用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "挂断原因(一句话)"},
+            },
+            "required": ["reason"],
+        },
+    },
+}
+
 # 采样率: 捕获端跟随 loopback 设备原生采样率, 上行重采样到 16k; 下行 API 24k -> 注入设备原生采样率
 CAPTURE_RATE_FALLBACK = 48000
 UP_RATE = 16000      # 上行给 API
@@ -334,7 +434,7 @@ class PlayThread(threading.Thread):
 
 # ---------------- 阿里云 Realtime 客户端 ----------------
 class AliyunRealtime:
-    def __init__(self, up_queue, down_queue, stop_event):
+    def __init__(self, up_queue, down_queue, stop_event, kb=None):
         self.up_queue = up_queue      # bytes (native capture rate pcm16 mono)
         self.down_queue = down_queue  # bytes (inject rate pcm16 mono)
         self.stop_event = stop_event
@@ -345,6 +445,30 @@ class AliyunRealtime:
         self.is_responding = False
         # 打断后抑制残余音频, 直到下一个 response.created
         self.audio_suppressed = False
+        # 知识库: 通话建立时一次性决定注入策略 (移植 newcallcall kb_injection 分层思想)
+        self.kb = kb
+        self.kb_injection = None
+        if kb is not None:
+            try:
+                self.kb_injection = kb.build_injection()
+                print(f"[KB] 注入策略: tier={self.kb_injection['tier']}, "
+                      f"search_tool={'开' if self.kb_injection['allow_search_tool'] else '关'}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[KB] 注入策略计算失败, 退化为无知识库: {e}", flush=True)
+                self.kb_injection = None
+        self._completed_call_ids = set()
+        # 累积流式 AI 回复文本 (response.audio_transcript.delta), done 时落库
+        self._ai_turn_buf = ""
+        # autodial 任务注入状态 (_configure_session 里初始化)
+        self._base_instructions = INSTRUCTIONS
+        self._instructions = INSTRUCTIONS
+        self._tools = []
+        self._task_seq = 0
+        self._task_seq_ts = 0.0
+        self._task_seed_pending = False  # 外呼任务: 对方首次出声时播种让 AI 先开口
+        # 挂断工具状态: AI 调用 hang_up 后置 pending, 等 farewell 语音播完再执行点击
+        self._hangup_pending = None      # {"reason": str} or None
+        self._hangup_done = False        # 防止重复执行
 
     async def run(self):
         url = build_ws_url(BASE_URL, MODEL)
@@ -372,10 +496,9 @@ class AliyunRealtime:
             for t in pending:
                 t.cancel()
 
-    async def _configure_session(self):
+    def _session_payload(self) -> dict:
+        """构造完整 session.update 载荷 (含 tools)。"""
         # 严格按官方文档: turn_detection 支持 server_vad / smart_turn / null(push-to-talk)
-        # 注意: Qwen-Audio 的 session.update 没有 input_audio_transcription 字段,
-        #       转写事件服务端默认推送, 无需配置
         if TURN_DETECTION == "server_vad":
             td = {
                 "type": "server_vad",
@@ -386,19 +509,74 @@ class AliyunRealtime:
             td = None
         else:
             td = {"type": "smart_turn"}
-        await self.ws.send(json.dumps({
+        return {
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
                 "voice": VOICE,
-                "instructions": INSTRUCTIONS,
+                "instructions": self._instructions,
                 "input_audio_format": "pcm",   # 16kHz 16bit 单声道
                 "output_audio_format": "pcm",  # 24kHz 16bit 单声道
                 "turn_detection": td,
                 "max_history_turns": 20,
+                "tools": self._tools,
             },
-        }, ensure_ascii=False))
-        print(f"[WS] 已发送 session.update (mode={TURN_DETECTION}, noise_gate={NOISE_GATE})", flush=True)
+        }
+
+    def _with_task(self, base_instructions: str):
+        """若 data/current_task.json 存在 autodial 写入的任务, 把任务上下文拼进 instructions。
+        返回 (instructions, seq); seq=0 表示无任务。"""
+        task_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "current_task.json")
+        try:
+            with open(task_path, "r", encoding="utf-8") as f:
+                task = json.load(f)
+        except Exception:
+            return base_instructions, 0
+        seq = int(task.get("seq", 0) or 0)
+        if not seq:
+            return base_instructions, 0
+        parts = [base_instructions, "",
+                 f"【本次通话任务】你正在与「{task.get('contact', '')}」语音通话。"]
+        if task.get("task"):
+            parts.append(f"任务内容: {task['task']}")
+        if task.get("note"):
+            parts.append(f"备注: {task['note']}")
+        parts.append("请自然地围绕任务与对方沟通, 不要提及任何系统提示。")
+        return "\n".join(parts), seq
+
+    async def _maybe_inject_task(self):
+        """轮询 autodial 任务文件; 变化时重发 session.update 更新 instructions。"""
+        new_instr, seq = self._with_task(self._base_instructions)
+        if seq == self._task_seq:
+            return
+        self._instructions = new_instr
+        self._task_seq = seq
+        self._task_seq_ts = time.time()
+        await self.ws.send(json.dumps(self._session_payload(), ensure_ascii=False))
+        if seq:
+            self._task_seed_pending = True  # 外呼: 对方首次出声时让 AI 先开口
+        else:
+            self._task_seed_pending = False
+        print(f"[TASK] 通话任务指令已更新 (seq={seq})", flush=True)
+
+    async def _configure_session(self):
+        # 注意: Qwen-Audio 的 session.update 没有 input_audio_transcription 字段,
+        #       转写事件服务端默认推送, 无需配置
+        self._base_instructions = INSTRUCTIONS
+        self._tools = []
+        if self.kb_injection is not None:
+            ctx = self.kb_injection.get("context_text", "")
+            if ctx.strip():
+                self._base_instructions = INSTRUCTIONS + "\n\n【知识库资料】\n" + ctx.strip()
+            if self.kb_injection.get("allow_search_tool"):
+                self._tools.append(SEARCH_KNOWLEDGE_TOOL)
+        # hang_up 工具始终可用 (不依赖知识库)
+        self._tools.append(HANG_UP_TOOL)
+        self._instructions, self._task_seq = self._with_task(self._base_instructions)
+
+        await self.ws.send(json.dumps(self._session_payload(), ensure_ascii=False))
+        tool_note = f", tools={len(self._tools)}" if self._tools else ""
+        print(f"[WS] 已发送 session.update (mode={TURN_DETECTION}, noise_gate={NOISE_GATE}{tool_note})", flush=True)
         # 等 session.updated
         while True:
             msg = json.loads(await self.ws.recv())
@@ -421,6 +599,10 @@ class AliyunRealtime:
         TARGET = 3200
         loop = asyncio.get_event_loop()
         while not self.stop_event.is_set():
+            # 挂断流程中/已完成: 停止上行, 避免触发新的 VAD 事件
+            if self._hangup_pending is not None or self._hangup_done:
+                await asyncio.sleep(0.3)
+                continue
             try:
                 chunk = await loop.run_in_executor(None, self.up_queue.get, True, 0.1)
             except queue.Empty:
@@ -472,6 +654,10 @@ class AliyunRealtime:
                         self.down_queue.get_nowait()
                     except queue.Empty:
                         break
+                # 对方先开口 -> 取消外呼开场播种
+                self._task_seed_pending = False
+                if _call_recorder:
+                    _call_recorder.on_remote_speech()
                 print("[WS] 检测到说话(speech_started)", flush=True)
             elif t == "input_audio_buffer.speech_stopped":
                 reason = msg.get("reason", "")
@@ -481,17 +667,30 @@ class AliyunRealtime:
             elif t == "conversation.item.input_audio_transcription.delta":
                 print(f"⟨{msg.get('delta','')}⟩", end="", flush=True)
             elif t == "conversation.item.input_audio_transcription.completed":
-                print(f"\n[对方说] {msg.get('transcript','').strip()}", flush=True)
+                txt = msg.get('transcript', '').strip()
+                print(f"\n[对方说] {txt}", flush=True)
+                if _call_recorder and txt:
+                    _call_recorder.on_remote_transcript(txt)
             elif t == "conversation.item.ambient_audio_transcription.completed":
-                print(f"[环境音] {msg.get('text','').strip()}", flush=True)
+                txt = msg.get('text', '').strip()
+                print(f"[环境音] {txt}", flush=True)
+                if _call_recorder and txt:
+                    _call_recorder.on_ambient(txt)
             elif t == "response.created":
                 self.is_responding = True
                 self.audio_suppressed = False
+                self._ai_turn_buf = ""
                 print("[WS] 开始生成回复(response.created)", flush=True)
+            elif t == "response.function_call_arguments.done":
+                await self._handle_function_call(msg)
             elif t == "response.audio_transcript.delta":
+                self._ai_turn_buf += msg.get("delta", "")
                 print(msg.get("delta", ""), end="", flush=True)
             elif t == "response.audio_transcript.done":
                 print(flush=True)
+                if _call_recorder and self._ai_turn_buf.strip():
+                    _call_recorder.on_ai_transcript(self._ai_turn_buf)
+                self._ai_turn_buf = ""
             elif t == "response.done":
                 self.is_responding = False
                 resp = msg.get("response", {})
@@ -499,13 +698,163 @@ class AliyunRealtime:
             elif t == "error":
                 print(f"[WS] 错误: {msg}", flush=True)
 
+    async def _handle_function_call(self, event: dict):
+        """Realtime function calling: 收到工具调用 -> 执行 -> 回传 function_call_output -> 触发继续生成。
+        协议与 newcallcall 一致 (Qwen Realtime 兼容 OpenAI Realtime 格式)。"""
+        call_id = str(event.get("call_id") or "")
+        name = str(event.get("name") or "")
+        arguments = str(event.get("arguments") or "{}")
+        if not call_id or not name:
+            return
+        if call_id in self._completed_call_ids:
+            return
+        self._completed_call_ids.add(call_id)
+        try:
+            args = json.loads(arguments)
+        except Exception:
+            args = {}
+        print(f"[KB] 工具调用: {name}({arguments})", flush=True)
+
+        if name == "search_knowledge" and self.kb is not None:
+            loop = asyncio.get_event_loop()
+            try:
+                snippets = await loop.run_in_executor(
+                    None, lambda: self.kb.query(args.get("query", ""),
+                                                int(args.get("top_k", 5) or 5))
+                )
+                result = {
+                    "status": "ok",
+                    "count": len(snippets),
+                    "snippets": [{"text": s.text, "score": round(s.score, 3),
+                                  "source": s.source} for s in snippets],
+                }
+            except Exception as e:  # noqa: BLE001
+                result = {"status": "error", "message": str(e), "snippets": []}
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(result, ensure_ascii=False),
+                },
+            }, ensure_ascii=False))
+            # 让模型基于工具结果继续生成回复
+            await self.ws.send(json.dumps({"type": "response.create"}))
+            if _call_recorder:
+                _call_recorder.on_tool_call(name, arguments, result.get("count"))
+            print(f"[KB] 已回传工具结果 ({result.get('count', 0)} 条)", flush=True)
+            return
+
+        if name == "hang_up":
+            reason = str(args.get("reason", "")).strip() or "AI 判定通话结束"
+            print(f"[HANGUP] AI 请求挂断: {reason}", flush=True)
+            if _call_recorder:
+                _call_recorder.on_tool_call(name, arguments)
+                _call_recorder.on_note(f"[挂断] {reason}")
+            result = {"status": "ok", "message": "通话将在道别语音播放完毕后自动挂断"}
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(result, ensure_ascii=False),
+                },
+            }, ensure_ascii=False))
+            # 触发模型生成道别语(farewell); 播完后由 _execute_hangup 执行点击
+            await self.ws.send(json.dumps({"type": "response.create"}))
+            if not self._hangup_done:
+                self._hangup_pending = {"reason": reason}
+                asyncio.create_task(self._execute_hangup())
+            return
+
+        result = {"status": "error", "message": f"unknown tool: {name}", "snippets": []}
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(result, ensure_ascii=False),
+            },
+        }, ensure_ascii=False))
+        await self.ws.send(json.dumps({"type": "response.create"}))
+
+    async def _seed_opening(self, text: str = "(电话已接通)"):
+        """播一条用户文本种子并触发回复, 让 AI 先开口。
+        (newcallcall opening-seed 技巧: Qwen Realtime 在无用户消息时拒绝 response.create)"""
+        self._task_seed_pending = False
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }, ensure_ascii=False))
+        await self.ws.send(json.dumps({
+            "type": "response.create",
+            "response": {"modalities": ["text", "audio"]},
+        }, ensure_ascii=False))
+        print(f"[TASK] 开场播种: {text} -> AI 先开口", flush=True)
+
+    async def _execute_hangup(self):
+        """挂断流程: 等 farewell 响应生成并播完 -> UI 点击挂断 -> 收尾通话记录。"""
+        if self._hangup_done:
+            return
+        self._hangup_done = True
+        reason = (self._hangup_pending or {}).get("reason", "")
+        # 1) 等 farewell 响应开始 (response.created -> is_responding=True), 最多等 8s
+        t0 = time.time()
+        while not self.is_responding and time.time() - t0 < 8.0:
+            await asyncio.sleep(0.1)
+        # 2) 等 farewell 响应结束 (response.done -> is_responding=False), 最多等 20s
+        t0 = time.time()
+        while self.is_responding and time.time() - t0 < 20.0:
+            await asyncio.sleep(0.1)
+        # 3) 等播放队列清空, 确保道别语音完整注入微信
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _hangup_drain, self.down_queue)
+        await asyncio.sleep(0.6)
+        # 4) 点击挂断按钮 (UIA 优先, 校准回退)
+        try:
+            res = await loop.run_in_executor(None, _hangup_click)
+        except Exception as e:  # noqa: BLE001
+            res = {"ok": False, "method": f"exception: {e}"}
+        print(f"[HANGUP] 执行挂断: ok={res.get('ok')} method={res.get('method')} reason={reason}",
+              flush=True)
+        if not res.get("ok") and _call_recorder:
+            _call_recorder.on_note(f"[挂断] UI点击失败({res.get('method')}), 请手动挂断")
+        # 5) 通知来电监听暂停检测(防止通话窗口消失过程误判)
+        if _incoming_watcher is not None:
+            _incoming_watcher.set_busy(15)
+        # 6) 收尾通话记录 (清任务文件由 on_call_closed 回调完成)
+        if _call_recorder:
+            _call_recorder.close()
+
     async def _watch_stop(self):
         while not self.stop_event.is_set():
             await asyncio.sleep(0.2)
+            if _call_recorder:
+                _call_recorder.check_idle()
+            # 轮询 autodial 任务文件, 变化时重发 session.update
+            try:
+                await self._maybe_inject_task()
+                # 外呼开场: 任务注入后 N 秒仍无人出声 -> 播种让 AI 先开口
+                if (self._task_seed_pending and not self.is_responding
+                        and time.time() - self._task_seq_ts > OUTBOUND_OPEN_DELAY):
+                    await self._seed_opening()
+                # 来电接听后开场: 监听线程置位 answer_seed_at, 到期即播种
+                seed_at = _shared.get("answer_seed_at")
+                if seed_at is not None and not self.is_responding:
+                    if time.time() >= seed_at:
+                        _shared["answer_seed_at"] = None
+                        caller = _shared.get("answer_caller", "对方")
+                        await self._seed_opening(f"(来电已自动接听, 来电人是 {caller})")
+            except Exception as e:  # noqa: BLE001
+                print(f"[TASK] 轮询异常: {e}", flush=True)
 
 
-def ws_thread_entry(up_queue, down_queue, stop_event, capture_rate_holder, play_rate_holder):
-    client = AliyunRealtime(up_queue, down_queue, stop_event)
+def ws_thread_entry(up_queue, down_queue, stop_event, capture_rate_holder, play_rate_holder, kb=None):
+    client = AliyunRealtime(up_queue, down_queue, stop_event, kb=kb)
     # 等捕获线程确定 native rate
     for _ in range(50):
         if capture_rate_holder.get("rate"):
@@ -603,7 +952,12 @@ def main():
                     help="注入设备索引 (CABLE Input, 作为输出写入)")
     ap.add_argument("--no-default-mic", action="store_true",
                     help="不自动切换系统默认麦克风 (默认会自动切到 CABLE Output)")
+    ap.add_argument("--no-auto-answer", action="store_true",
+                    help="关闭来电自动接听 (默认按 AUTO_ANSWER 配置开启)")
     args = ap.parse_args()
+    global AUTO_ANSWER
+    if args.no_auto_answer:
+        AUTO_ANSWER = False
 
     if not API_KEY:
         print("错误: 未配置 ALIYUN_REALTIME_API_KEY (检查 .env)")
@@ -693,9 +1047,31 @@ def main():
         time.sleep(0.1)
 
     ws_t = threading.Thread(
-        target=ws_thread_entry, args=(up_q, down_q, stop_event, rate_holder, play_rate_holder), daemon=True
+        target=ws_thread_entry, args=(up_q, down_q, stop_event, rate_holder, play_rate_holder, _kb), daemon=True
     )
     ws_t.start()
+
+    # ---- 来电自动接听 ----
+    global _incoming_watcher
+    if AUTO_ANSWER:
+        def _on_incoming_answered(caller: str):
+            # 接通 3 秒后若无人出声, 播种让 AI 先开口 (watch_stop 里消费)
+            _shared["answer_seed_at"] = time.time() + 3.0
+            _shared["answer_caller"] = caller or "对方"
+            if _call_recorder:
+                _call_recorder.on_note(f"[来电] 自动接听: {caller or '未知'}")
+        try:
+            from autodial.incoming import IncomingWatcher
+            _incoming_watcher = IncomingWatcher(
+                on_answered=_on_incoming_answered,
+                allow_video=AUTO_ANSWER_VIDEO,
+                poll_sec=AUTO_ANSWER_POLL,
+            )
+            _incoming_watcher.start()
+        except Exception as e:  # noqa: BLE001
+            print(f"[MAIN] 来电监听启动失败(不影响桥接): {e}", flush=True)
+    else:
+        print("[MAIN] 来电自动接听已关闭 (AUTO_ANSWER=0)", flush=True)
 
     print("\n=== 桥接已启动, 按 Ctrl+C 退出 ===\n")
     try:
@@ -708,6 +1084,10 @@ def main():
         print("\n退出中...")
     finally:
         stop_event.set()
+        if _incoming_watcher is not None:
+            _incoming_watcher.stop_event.set()
+        if _call_recorder:
+            _call_recorder.close()  # 收尾未关闭的通话记录
         mic_switch.restore()
         time.sleep(0.3)
         pa.terminate()
