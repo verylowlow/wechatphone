@@ -1,4 +1,4 @@
-"""Batch dialer: dial a list of (contact, task) sequentially.
+"""Batch dialer: dial a list of (contact, task) sequentially (adapter-driven).
 
 Between calls it waits for the previous call to actually finish by watching
 the calllog store:
@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import time
 
-from autodial.dialer import WeChatDialer, DialError
+from adapters.base import AppConfig
+from adapters import DEFAULT_APP
+from autodial.dialer import AppDialer, DialError
 from autodial.taskfile import TASK_FILE
 
 
@@ -34,8 +36,9 @@ def _calls_after(store, ts: float) -> list:
 class BatchDialer:
     def __init__(self, dry_run: bool = False,
                  fixed_gap_sec: float = 30.0,
-                 call_timeout_sec: float = 600.0):
-        self.dialer = WeChatDialer(dry_run=dry_run)
+                 call_timeout_sec: float = 600.0,
+                 app: str | AppConfig = DEFAULT_APP):
+        self.dialer = AppDialer(dry_run=dry_run, app=app)
         self.store = _calllog_store()
         self.fixed_gap_sec = fixed_gap_sec
         self.call_timeout_sec = call_timeout_sec
@@ -54,28 +57,33 @@ class BatchDialer:
                 newest = calls[0]  # list_calls 按 started_at DESC
                 if newest["ended_at"]:
                     print(f"[BATCH] 通话 {newest['call_id']} 已结束, 继续下一个", flush=True)
-                    time.sleep(2.0)  # 喘息, 让微信回到可搜索状态
+                    time.sleep(2.0)  # 喘息, 让应用回到可搜索状态
                     return
                 seen = newest["call_id"]
             time.sleep(2.0)
         print(f"[BATCH] 等待超时({self.call_timeout_sec:.0f}s)"
               f"{' (通话 ' + seen + ' 仍未结束)' if seen else ' (未检测到通话开始)'}, 继续下一个", flush=True)
 
-    def run(self, items: list[dict]) -> list[dict]:
-        """items: [{'contact': str, 'task': str, 'note': str?}, ...]"""
+    def run(self, items: list[dict], opening: str = "") -> list[dict]:
+        """items: [{'contact': str, 'task': str, 'note': str?, 'opening': str?}, ...]
+
+        opening: 批次共享开场白 (任务发起人指定); 单条 item 自带 opening 时优先用单条的。
+        """
         results = []
         total = len(items)
         for i, it in enumerate(items, 1):
             contact = it.get("contact", "").strip()
             task = it.get("task", "")
             note = it.get("note", "")
+            item_opening = (it.get("opening") or "").strip() or opening
             if not contact:
                 results.append({"contact": contact, "status": "skipped", "error": "空联系人名"})
                 continue
             print(f"\n[BATCH] ({i}/{total}) 拨打: {contact}", flush=True)
             started_after = time.time() - 1.0
             try:
-                info = self.dialer.dial(contact, task=task, note=note)
+                info = self.dialer.dial(contact, task=task, note=note,
+                                        opening=item_opening)
                 results.append({"contact": contact, "status": "dialed", **info})
                 if not self.dialer.dry_run and i < total:
                     self._wait_for_call_end(started_after)

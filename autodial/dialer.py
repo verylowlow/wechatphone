@@ -1,15 +1,16 @@
-"""WeChatDialer: UI-automation voice-call placement for PC WeChat.
+# -*- coding: utf-8 -*-
+"""AppDialer: UI-automation voice-call placement, driven by an AppConfig.
 
 Flow (per contact):
-  1. find & activate the WeChat main window (pywinauto/UIA)
-  2. Ctrl+F to focus the search box
+  1. find & activate the app main window (pywinauto/UIA, via adapter)
+  2. cfg.search_hotkey to focus the search box
   3. paste contact name via clipboard (中文输入法安全)
   4. Enter -> open the chat
   5. click the voice-call button: template match first (calibrated screenshot),
      window-offset coordinate fallback
-Calibration data lives in data/autodial_calib.json (see calibrate.py).
+Calibration data lives in data/autodial_calib_<app>.json (see calibrate.py).
 
-NOTE: UI automation is inherently brittle across WeChat versions. That's why
+NOTE: UI automation is inherently brittle across app versions. That's why
 every step is logged, `dry_run` skips clicks, and the batch runner waits for
 the previous call to end via the calllog store.
 """
@@ -18,49 +19,40 @@ from __future__ import annotations
 import os
 import time
 
-from autodial.taskfile import load_calib
-
-SEARCH_HOTKEY = "^f"          # 微信主界面搜索快捷键
-SEARCH_RESULT_WAIT = 1.2      # 输入联系人后等待搜索结果
-OPEN_CHAT_WAIT = 1.5          # Enter 打开会话后等待界面渲染
-POST_DIAL_WAIT = 2.0
+from adapters.base import AppConfig, find_main_window
+from adapters import get_app, DEFAULT_APP
+from autodial.taskfile import load_calib, tmpl_path
 
 
 class DialError(Exception):
     pass
 
 
-class WeChatDialer:
-    def __init__(self, dry_run: bool = False):
+class AppDialer:
+    def __init__(self, dry_run: bool = False, app: str | AppConfig = DEFAULT_APP):
         self.dry_run = dry_run
-        self.calib = load_calib()
+        self.cfg = app if isinstance(app, AppConfig) else get_app(app)
+        self.calib = load_calib(self.cfg.key)
+        if self.cfg.ui_engine in ("vision41", "wecom_vision"):
+            return  # 视觉方案无需校准
         if self.calib is None or not self.calib.get("calibrated_at"):
-            raise DialError("未找到有效校准数据 data/autodial_calib.json, 请先运行: "
-                            "python -m autodial.cli calibrate")
+            raise DialError(
+                f"未找到 {self.cfg.display_name} 的有效校准数据, 请先运行: "
+                f"python -m autodial.cli calibrate --app {self.cfg.key}"
+            )
 
     # ---------- window management ----------
 
-    def _find_wechat_window(self):
-        """Return the active pywinauto UIA wrapper for the WeChat main window."""
-        from pywinauto import Desktop
-        candidates = []
+    def _find_window(self):
+        """Return the active pywinauto UIA wrapper for the app main window."""
         try:
-            for w in Desktop(backend="uia").windows():
-                try:
-                    title = w.window_text()
-                except Exception:
-                    continue
-                if title and ("微信" in title or "WeChat" in title):
-                    candidates.append(w)
-        except Exception as e:  # noqa: BLE001
-            raise DialError(f"枚举窗口失败: {e}")
-        if not candidates:
-            raise DialError("未找到微信窗口, 请确认微信已登录且主窗口未最小化")
-        # 优先精确标题 "微信"
-        for w in candidates:
-            if w.window_text().strip() == "微信":
-                return w
-        return candidates[0]
+            w = find_main_window(self.cfg)
+        except RuntimeError as e:
+            raise DialError(str(e))
+        if w is None:
+            raise DialError(f"未找到 {self.cfg.display_name} 窗口, "
+                            f"请确认已登录且主窗口未最小化")
+        return w
 
     def _activate(self, w) -> None:
         try:
@@ -72,22 +64,31 @@ class WeChatDialer:
 
     # ---------- dial ----------
 
-    def dial(self, contact: str, task: str = "", note: str = "") -> dict:
-        """Place a voice call to `contact`. Returns an info dict."""
-        if task:
+    def dial(self, contact: str, task: str = "", note: str = "",
+             opening: str = "") -> dict:
+        """Place a voice call to `contact`. Returns an info dict.
+
+        opening: 任务发起人指定的开场白文本 (注入 instructions, AI 接通后第一句说它)。
+        """
+        if task or opening:
             from autodial.taskfile import write_current_task
-            write_current_task(contact, task, note)
+            write_current_task(contact, task, note, app=self.cfg.key, opening=opening)
             print(f"[AUTODIAL] 任务已写入 current_task.json: {contact} -> {task[:40]}", flush=True)
 
-        print(f"[AUTODIAL] 查找微信窗口...", flush=True)
-        w = self._find_wechat_window()
+        if self.cfg.ui_engine == "wecom_vision":
+            return self._dial_wecom_vision(contact)
+        if self.cfg.ui_engine == "vision41":
+            return self._dial_vision41(contact)
+
+        print(f"[AUTODIAL] 查找 {self.cfg.display_name} 窗口...", flush=True)
+        w = self._find_window()
         print(f"[AUTODIAL] 找到窗口: '{w.window_text()}'", flush=True)
         self._activate(w)
 
         # 1) 搜索联系人
-        print(f"[AUTODIAL] Ctrl+F 打开搜索", flush=True)
+        print(f"[AUTODIAL] {self.cfg.search_hotkey} 打开搜索", flush=True)
         if not self.dry_run:
-            w.type_keys(SEARCH_HOTKEY, with_spaces=False)
+            w.type_keys(self.cfg.search_hotkey, with_spaces=False)
             time.sleep(0.6)
 
         # 2) 剪贴板粘贴联系人名 (避免中文输入法问题)
@@ -97,30 +98,93 @@ class WeChatDialer:
             pyperclip.copy(contact)
             time.sleep(0.15)
             w.type_keys("^v")
-            time.sleep(SEARCH_RESULT_WAIT)
+            time.sleep(self.cfg.search_result_wait)
 
         # 3) Enter 打开会话
         print(f"[AUTODIAL] Enter 打开会话", flush=True)
         if not self.dry_run:
             w.type_keys("{ENTER}")
-            time.sleep(OPEN_CHAT_WAIT)
+            time.sleep(self.cfg.open_chat_wait)
 
         # 4) 点击语音通话按钮
         pos = self._locate_call_button(w)
         if pos is None:
             raise DialError("未找到语音通话按钮 (模板匹配失败且无坐标回退); "
-                            "请重新校准或检查微信窗口是否被遮挡")
+                            f"请重新校准或检查 {self.cfg.display_name} 窗口是否被遮挡")
         print(f"[AUTODIAL] 点击语音通话按钮 @ {pos}", flush=True)
         if not self.dry_run:
             import pyautogui
             pyautogui.moveTo(pos[0], pos[1], duration=0.2)
             time.sleep(0.15)
             pyautogui.click()
-            time.sleep(POST_DIAL_WAIT)
+            time.sleep(self.cfg.post_dial_wait)
 
         print(f"[AUTODIAL] 已向 {contact} 发起语音通话" + (" (dry-run 未实际点击)" if self.dry_run else ""),
               flush=True)
         return {"contact": contact, "clicked": pos, "dry_run": self.dry_run}
+
+    # ---------- vision41 (微信 4.1+ 视觉拨号) ----------
+
+    def _dial_vision41(self, contact: str) -> dict:
+        """2026-08-10 实测流程: 通讯录→搜索(OCR)→点完全命中→语音通话→菜单第一项。"""
+        from autodial import wx41
+        if self.dry_run:
+            print(f"[AUTODIAL] (dry-run) vision41 预演: 通讯录→搜索 {contact} "
+                  f"→点击首条命中→语音通话", flush=True)
+            return {"contact": contact, "clicked": None, "dry_run": True}
+        print(f"[AUTODIAL] vision41: 激活微信, 进入通讯录...", flush=True)
+        wx41.open_contacts()
+        print(f"[AUTODIAL] vision41: 精确搜索 {contact}", flush=True)
+        try:
+            hits = wx41.search_contact(contact)
+        except wx41.DuplicateContactError as e:
+            self._log_duplicate(str(e), contact)
+            raise DialError(str(e))
+        if not hits:
+            raise DialError(f"通讯录搜索无完全命中记录: {contact}")
+        wx41.open_first_result(hits)
+        wx41.start_voice_call()
+        print(f"[AUTODIAL] 已向 {contact} 发起语音通话 (vision41)", flush=True)
+        return {"contact": contact, "clicked": "vision41", "dry_run": False}
+
+    # ---------- wecom_vision (企业微信 视觉拨号) ----------
+
+    def _dial_wecom_vision(self, contact: str) -> dict:
+        """2026-08-10 实测流程: 通讯录→搜索清除+精确输入→点第一条→语音通话。"""
+        from autodial import wecom_ui
+        if self.dry_run:
+            print(f"[AUTODIAL] (dry-run) wecom 预演: 通讯录→搜索 {contact} "
+                  f"→点击首条命中→语音通话", flush=True)
+            return {"contact": contact, "clicked": None, "dry_run": True}
+        print(f"[AUTODIAL] wecom: 激活企业微信, 进入通讯录...", flush=True)
+        wecom_ui.open_contacts()
+        print(f"[AUTODIAL] wecom: 清除并精确搜索 {contact}", flush=True)
+        try:
+            hits = wecom_ui.search_contact(contact)
+        except wecom_ui.DuplicateContactError as e:
+            self._log_duplicate(str(e), contact)
+            raise DialError(str(e))
+        if not hits:
+            raise DialError(f"通讯录搜索无命中记录: {contact}")
+        wecom_ui.open_first_result(hits)
+        info = wecom_ui.start_voice_call()
+        print(f"[AUTODIAL] 已向 {contact} 发起语音通话 (wecom_vision)", flush=True)
+        return {"contact": contact, "clicked": "wecom_vision", "info": info,
+                "dry_run": False}
+
+    def _log_duplicate(self, msg: str, contact: str) -> None:
+        """同名重复 → 终止呼叫, 并记入通话记录 (note 事件 + 摘要)。"""
+        try:
+            from calllog.store import CallStore
+            st = CallStore()
+            cid = time.strftime("%Y%m%d-%H%M%S") + "-dup"
+            st.create_call(cid, app=self.cfg.key, contact=contact)
+            st.add_event(cid, "note", msg)
+            st.set_summary(cid, msg)
+            st.end_call(cid)
+            print(f"[AUTODIAL] {msg} (已记入通话记录 {cid})", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[AUTODIAL] 记录重复名称失败: {e}", flush=True)
 
     # ---------- button location ----------
 
@@ -152,3 +216,9 @@ class WeChatDialer:
         except Exception as e:  # noqa: BLE001
             print(f"[AUTODIAL] 模板匹配异常: {e}", flush=True)
         return None
+
+
+class WeChatDialer(AppDialer):
+    """向后兼容: 旧代码直接 `WeChatDialer(...)` 仍可用 (固定 wechat)。"""
+    def __init__(self, dry_run: bool = False):
+        super().__init__(dry_run=dry_run, app="wechat")

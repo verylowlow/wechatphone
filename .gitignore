@@ -8,5 +8,8 @@ data/
 # Temp
 *.tmp
 
+# WorkBuddy local memory (not part of the project)
+.workbuddy/
+
 # NOTE: .env is currently tracked (user's v1.0.0 baseline includes it).
 # If you want to stop tracking it: git rm --cached .env

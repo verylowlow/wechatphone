@@ -13,3 +13,4 @@ pyautogui
 pyperclip
 pillow
 opencv-python-headless
+rapidocr-onnxruntime

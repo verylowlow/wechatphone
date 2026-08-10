@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Incoming-call watcher: detect WeChat voice-call popups and auto-answer.
+"""Incoming-call watcher: detect an app's voice-call popup and auto-answer.
 
 Detection strategy (no calibration needed):
-  scan all UIA windows for a Button whose name contains 接听/接受/接起.
-  The presence of such a button IS the incoming-call signal.
+  scan all UIA windows for a Button whose name matches the app's configured
+  answer_button_names. The presence of such a button IS the incoming-call signal.
 
 Answer strategy:
   1. UIA invoke/click_input on the found button (preferred);
-  2. calibrated template/coordinate fallback (from autodial_calib.json).
+  2. calibrated template/coordinate fallback (from autodial_calib_<app>.json).
 
-Video calls are detected by "视频" in the popup text and skipped unless
+Video calls are detected via the app's video_keywords and skipped unless
 allow_video=True.
 """
 from __future__ import annotations
@@ -17,69 +17,18 @@ from __future__ import annotations
 import threading
 import time
 
-ANSWER_NAMES = ("接听", "接受", "接起")
-
-
-def _buttons(win):
-    try:
-        return win.descendants(control_type="Button")
-    except Exception:
-        return []
-
-
-def find_incoming():
-    """Scan UIA windows for an incoming-call popup.
-
-    Returns (popup_window, answer_button, is_video) or None.
-    """
-    from pywinauto import Desktop
-    try:
-        windows = Desktop(backend="uia").windows()
-    except Exception as e:  # noqa: BLE001
-        print(f"[INCOMING] 枚举窗口失败: {e}", flush=True)
-        return None
-    for w in windows:
-        try:
-            title = w.window_text() or ""
-        except Exception:
-            continue
-        for b in _buttons(w):
-            try:
-                name = (b.window_text() or "").strip()
-            except Exception:
-                continue
-            if name and any(k in name for k in ANSWER_NAMES):
-                # 弹窗全文里出现"视频"则视为视频来电
-                is_video = False
-                try:
-                    is_video = "视频" in (title + " " + w.text_block())
-                except Exception:
-                    is_video = "视频" in title
-                return w, b, is_video
-    return None
-
-
-def guess_caller_name(popup) -> str:
-    """从来电弹窗提取主叫人昵称 (尽力而为, 失败返回 '对方')."""
-    try:
-        title = (popup.window_text() or "").strip()
-        for noise in ("微信语音通话", "微信视频通话", "语音通话", "视频通话",
-                      "邀请你", "邀请与您", "来电"):
-            title = title.replace(noise, "")
-        title = title.strip(" -·|:：\t")
-        if title and len(title) <= 30:
-            return title
-    except Exception:
-        pass
-    return "对方"
+from adapters.base import AppConfig, find_incoming, guess_caller_name
+from adapters import get_app, DEFAULT_APP
 
 
 class IncomingWatcher(threading.Thread):
     """轮询来电弹窗, 发现即接听, 并通过 on_answered(caller_name) 通知桥接。"""
 
     def __init__(self, on_answered=None, allow_video: bool = False,
-                 poll_sec: float = 1.0, cooldown_sec: float = 12.0):
+                 poll_sec: float = 1.0, cooldown_sec: float = 12.0,
+                 app: str | AppConfig = DEFAULT_APP):
         super().__init__(daemon=True, name="IncomingWatcher")
+        self.cfg = app if isinstance(app, AppConfig) else get_app(app)
         self.on_answered = on_answered
         self.allow_video = allow_video
         self.poll_sec = poll_sec
@@ -92,14 +41,14 @@ class IncomingWatcher(threading.Thread):
         self._busy_until = time.time() + (sec if sec is not None else self.cooldown_sec)
 
     def run(self) -> None:
-        print(f"[INCOMING] 来电监听已启动 (poll={self.poll_sec}s, "
+        print(f"[INCOMING] 来电监听已启动 ({self.cfg.display_name}, poll={self.poll_sec}s, "
               f"video={'允许' if self.allow_video else '不接'})", flush=True)
         while not self.stop_event.is_set():
             time.sleep(self.poll_sec)
             if time.time() < self._busy_until:
                 continue
             try:
-                hit = find_incoming()
+                hit = self._detect()
             except Exception as e:  # noqa: BLE001
                 print(f"[INCOMING] 检测异常: {e}", flush=True)
                 continue
@@ -110,7 +59,11 @@ class IncomingWatcher(threading.Thread):
                 print("[INCOMING] 检测到【视频】来电, 已配置不接, 跳过", flush=True)
                 self.set_busy(8)
                 continue
-            caller = guess_caller_name(popup)
+            if self.cfg.ui_engine == "vision41":
+                from autodial import wx41
+                caller = wx41.incoming_caller_name() or "对方"
+            else:
+                caller = guess_caller_name(popup, self.cfg)
             print(f"[INCOMING] 检测到来电: {caller} ({'视频' if is_video else '语音'}), 自动接听...",
                   flush=True)
             ok = self._answer(popup, btn)
@@ -126,7 +79,26 @@ class IncomingWatcher(threading.Thread):
                 print("[INCOMING] 接听失败, 等待重试", flush=True)
                 self.set_busy(5)
 
+    def _detect(self):
+        """vision41: 全屏找大绿圆; 否则: UIA 扫描接听按钮。
+
+        vision41 返回 (popup=None, btn='green_circle', is_video=False)。
+        """
+        if self.cfg.ui_engine in ("vision41", "wecom_vision"):
+            # 来电大绿圆 (微信4.1/企微 视觉方案通用)
+            from autodial import wx41
+            import pyautogui
+            pos = wx41._find_circle(pyautogui.screenshot(), "green")
+            if pos:
+                return None, "green_circle", False
+            return None
+        return find_incoming(self.cfg)
+
     def _answer(self, popup, btn) -> bool:
+        # 0) vision41: 大绿圆
+        if btn == "green_circle":
+            from autodial import wx41
+            return bool(wx41.answer_incoming().get("ok"))
         # 1) UIA 直接点按钮
         try:
             try:
@@ -136,19 +108,19 @@ class IncomingWatcher(threading.Thread):
             return True
         except Exception as e:  # noqa: BLE001
             print(f"[INCOMING] UIA 点击失败({e}), 尝试校准坐标回退", flush=True)
-        # 2) 校准回退 (answer_offset 相对微信主窗口)
+        # 2) 校准回退 (answer_offset 相对应用主窗口)
         try:
+            from adapters.base import find_main_window
             from autodial.taskfile import load_calib
-            from autodial.dialer import WeChatDialer
-            calib = load_calib() or {}
+            calib = load_calib(self.cfg.key) or {}
             off = calib.get("answer_offset")
             if off:
-                w = WeChatDialer.__new__(WeChatDialer)  # 不触发校准校验
-                win = w._find_wechat_window()
-                r = win.rectangle()
-                import pyautogui
-                pyautogui.click(int(r.left) + int(off["x"]), int(r.top) + int(off["y"]))
-                return True
+                win = find_main_window(self.cfg)
+                if win is not None:
+                    r = win.rectangle()
+                    import pyautogui
+                    pyautogui.click(int(r.left) + int(off["x"]), int(r.top) + int(off["y"]))
+                    return True
         except Exception as e:  # noqa: BLE001
             print(f"[INCOMING] 坐标回退失败: {e}", flush=True)
         return False

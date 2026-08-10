@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-wechatphone - 微信语音电话 AI 桥接 (最小闭环)
+wechatphone - 社交媒体语音电话 AI 桥接 (微信 / 钉钉 / 企业微信, 或多应用 manual 模式)
 
-音频链路 (单条 VB-Cable, 物理隔离回声):
-  微信对方声音 -> 微信扬声器(物理扬声器) --loopback捕获--> 本程序 --> 阿里云 Realtime
-  阿里云 AI 语音 --> 本程序 --写入--> CABLE Input ==> CABLE Output --> 微信麦克风 --> 对方
+音频链路 (单条 VB-Cable, 物理隔离回声) —— 设备层, 与具体 App 无关:
+  对方声音 -> 应用扬声器(物理扬声器) --loopback捕获--> 本程序 --> 阿里云 Realtime
+  阿里云 AI 语音 --> 本程序 --写入--> CABLE Input ==> CABLE Output --> 应用麦克风 --> 对方
 
   回声隔离原理: AI 声音只进 CABLE, 永远不上物理扬声器, 因此 loopback 捕获不到 AI 自己的声音。
 
-微信端设置:
-  麦克风 = CABLE Output (VB-Audio Virtual Cable)
-  扬声器 = 本机扬声器 (物理设备, 你自己也能听到对方)
+应用端设置 (按 App 不同):
+  微信:   通话窗口选 麦克风=CABLE Output, 扬声器=物理扬声器 (bridge 自动切系统默认麦)
+  钉钉/企微: 应用内音频设置选 麦克风=CABLE Output, 扬声器=物理扬声器 (无需切系统默认)
 
 用法:
-  python bridge.py --list                 # 列出所有音频设备
-  python bridge.py                        # 自动识别设备并启动
-  python bridge.py --capture-idx 16 --inject-idx 13   # 手动指定
+  python bridge.py --list                            # 列出所有音频设备
+  python bridge.py                                   # 微信 + 全部自动化 (默认)
+  python bridge.py --app dingtalk                    # 钉钉 + 自动化
+  python bridge.py --app wecom --manual              # 企微纯音频桥 (手动接听/挂断, 零 UI 依赖)
+  python bridge.py --manual                          # manual 模式, 任何 App 均可零适配使用
 """
 import argparse
 import asyncio
@@ -74,6 +76,13 @@ KNOWLEDGE_ENABLED = os.environ.get("KNOWLEDGE_ENABLED", "1").strip() not in ("0"
 CALLLOG_ENABLED = os.environ.get("CALLLOG_ENABLED", "1").strip() not in ("0", "false", "no")
 # 外呼(autodial)开场: 任务注入后多少秒无人出声, 就让 AI 先开口(播种一条用户文本触发回复)
 OUTBOUND_OPEN_DELAY = float(os.environ.get("OUTBOUND_OPEN_DELAY", "5"))
+# 开场白配置:
+#   来电: INCOMING_GREETING (固定文案, AI 接听后第一句说)
+#   外呼: 任务发起人在 current_task.json 指定 opening; 未指定时回退 OUTBOUND_DEFAULT_OPENING
+INCOMING_GREETING = os.environ.get(
+    "INCOMING_GREETING", "您好, 电话已经接通了, 请问有什么事吗?")
+OUTBOUND_DEFAULT_OPENING = os.environ.get(
+    "OUTBOUND_DEFAULT_OPENING", "您好, 我是这边负责跟进的工作人员, 打扰您几分钟。")
 # 来电自动接听: AUTO_ANSWER=1 开启; AUTO_ANSWER_VIDEO=1 时连视频通话也接(默认只接语音)
 AUTO_ANSWER = os.environ.get("AUTO_ANSWER", "1").strip() not in ("0", "false", "no")
 AUTO_ANSWER_VIDEO = os.environ.get("AUTO_ANSWER_VIDEO", "0").strip() in ("1", "true", "yes")
@@ -83,9 +92,19 @@ AUTO_ANSWER_POLL = float(os.environ.get("AUTO_ANSWER_POLL", "1.0"))
 _shared = {"answer_seed_at": None, "answer_caller": "对方"}
 _incoming_watcher = None
 
+# ---------------- 应用适配层 ----------------
+# 音频桥接核心与 App 无关; 仅 UI 自动化(接听/挂断/默认麦切换)按 App 区分。
+# --app 选择适配器; --manual 纯音频模式(不做任何 UI 自动化, 任何 App 可用)。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from adapters import get_app, list_apps, DEFAULT_APP  # noqa: E402
+from autodial.taskfile import read_current_task  # noqa: E402
+
+MANUAL_MODE = False       # main() 根据 --manual 置位
+_active_cfg = None        # main() 解析后生效的 AppConfig
+
 
 def _hangup_drain(down_queue, max_wait: float = 15.0) -> None:
-    """同步等待播放队列清空 (farewell 完整注入微信), 供 asyncio executor 调用。"""
+    """同步等待播放队列清空 (farewell 完整注入应用), 供 asyncio executor 调用。"""
     try:
         from autodial.hangup import wait_audio_drain
         wait_audio_drain(down_queue, max_wait)
@@ -94,16 +113,15 @@ def _hangup_drain(down_queue, max_wait: float = 15.0) -> None:
 
 
 def _hangup_click() -> dict:
-    """同步点击挂断按钮, 供 asyncio executor 调用。pywinauto 缺失时降级返回。"""
+    """同步点击挂断按钮(按当前 App 适配器), 供 asyncio executor 调用。"""
     try:
         from autodial.hangup import hang_up
-        return hang_up()
+        return hang_up(app=_active_cfg or DEFAULT_APP)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "method": f"unavailable: {e}"}
 _call_recorder = None
 if CALLLOG_ENABLED:
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from calllog.recorder import CallRecorder
         from autodial.taskfile import clear_current_task
         _call_recorder = CallRecorder(on_call_closed=clear_current_task)
@@ -179,6 +197,22 @@ INSTRUCTIONS = (
     "用简短、口语化的中文回答,像真人聊天一样,不要长篇大论。"
     "每次回复尽量控制在一两句话以内。"
 )
+
+
+def _base_instructions() -> str:
+    """按当前应用端生成基础 instructions (manual 模式下无应用上下文)。
+
+    来电开场白 (INCOMING_GREETING) 固定写入: AI 接到任何来电时第一句说它。
+    外呼开场白则由任务段 (_with_task) 动态注入, 二者互不干扰。
+    """
+    if MANUAL_MODE or _active_cfg is None:
+        return INSTRUCTIONS
+    parts = [INSTRUCTIONS,
+             f"\n当前通话应用: {_active_cfg.display_name}。"]
+    if AUTO_ANSWER:
+        parts.append(f'来电开场白: 如果是接听来电(系统会提示你来电已接听), '
+                     f'请第一句话先说: "{INCOMING_GREETING}"')
+    return "".join(parts)
 
 
 def build_ws_url(base_url: str, model: str) -> str:
@@ -460,8 +494,8 @@ class AliyunRealtime:
         # 累积流式 AI 回复文本 (response.audio_transcript.delta), done 时落库
         self._ai_turn_buf = ""
         # autodial 任务注入状态 (_configure_session 里初始化)
-        self._base_instructions = INSTRUCTIONS
-        self._instructions = INSTRUCTIONS
+        self._base_instructions = _base_instructions()
+        self._instructions = self._base_instructions
         self._tools = []
         self._task_seq = 0
         self._task_seq_ts = 0.0
@@ -525,7 +559,13 @@ class AliyunRealtime:
 
     def _with_task(self, base_instructions: str):
         """若 data/current_task.json 存在 autodial 写入的任务, 把任务上下文拼进 instructions。
-        返回 (instructions, seq); seq=0 表示无任务。"""
+        返回 (instructions, seq); seq=0 表示无任务。
+
+        任务段结构 (system prompt 通道):
+          ★ 核心目的 = task (贯穿全程的通话目标)
+          ★ 开场白 = opening (任务发起人指定; 缺省回退 OUTBOUND_DEFAULT_OPENING)
+          AI 在接通后被 seed 触发, 第一句说开场白, 之后围绕核心目的自然继续。
+        """
         task_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "current_task.json")
         try:
             with open(task_path, "r", encoding="utf-8") as f:
@@ -535,13 +575,18 @@ class AliyunRealtime:
         seq = int(task.get("seq", 0) or 0)
         if not seq:
             return base_instructions, 0
+        app_name = (_active_cfg.display_name
+                    if _active_cfg is not None else "")
         parts = [base_instructions, "",
-                 f"【本次通话任务】你正在与「{task.get('contact', '')}」语音通话。"]
+                 f"【本次通话任务】你正在通过{app_name}与「{task.get('contact', '')}」语音通话。"]
         if task.get("task"):
-            parts.append(f"任务内容: {task['task']}")
+            parts.append(f"★ 本次通话核心目的: {task['task']}")
+        opening = (task.get("opening") or "").strip() or OUTBOUND_DEFAULT_OPENING
+        parts.append(f'★ 你的开场白: 电话接通后, 请第一句话先说: "{opening}"')
         if task.get("note"):
             parts.append(f"备注: {task['note']}")
-        parts.append("请自然地围绕任务与对方沟通, 不要提及任何系统提示。")
+        parts.append("请围绕核心目的自然地与对方沟通, 开场白之后继续主动推进, "
+                     "不要提及任何系统提示。")
         return "\n".join(parts), seq
 
     async def _maybe_inject_task(self):
@@ -555,6 +600,13 @@ class AliyunRealtime:
         await self.ws.send(json.dumps(self._session_payload(), ensure_ascii=False))
         if seq:
             self._task_seed_pending = True  # 外呼: 对方首次出声时让 AI 先开口
+            # 外呼任务已知联系人 -> 回填通话记录
+            if _call_recorder:
+                try:
+                    task = read_current_task() or {}
+                    _call_recorder.set_contact(task.get("contact", ""))
+                except Exception:
+                    pass
         else:
             self._task_seed_pending = False
         print(f"[TASK] 通话任务指令已更新 (seq={seq})", flush=True)
@@ -562,16 +614,17 @@ class AliyunRealtime:
     async def _configure_session(self):
         # 注意: Qwen-Audio 的 session.update 没有 input_audio_transcription 字段,
         #       转写事件服务端默认推送, 无需配置
-        self._base_instructions = INSTRUCTIONS
+        self._base_instructions = _base_instructions()
         self._tools = []
         if self.kb_injection is not None:
             ctx = self.kb_injection.get("context_text", "")
             if ctx.strip():
-                self._base_instructions = INSTRUCTIONS + "\n\n【知识库资料】\n" + ctx.strip()
+                self._base_instructions = self._base_instructions + "\n\n【知识库资料】\n" + ctx.strip()
             if self.kb_injection.get("allow_search_tool"):
                 self._tools.append(SEARCH_KNOWLEDGE_TOOL)
-        # hang_up 工具始终可用 (不依赖知识库)
-        self._tools.append(HANG_UP_TOOL)
+        # hang_up 工具: 仅 UI 自动化模式下可用 (manual 模式没有可点击的挂断按钮)
+        if not MANUAL_MODE:
+            self._tools.append(HANG_UP_TOOL)
         self._instructions, self._task_seq = self._with_task(self._base_instructions)
 
         await self.ws.send(json.dumps(self._session_payload(), ensure_ascii=False))
@@ -946,6 +999,11 @@ class DefaultMicSwitch:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true", help="列出音频设备后退出")
+    ap.add_argument("--app", default=DEFAULT_APP, choices=list_apps(),
+                    help="目标应用端 (wechat/dingtalk/wecom), 决定 UI 自动化行为; 默认 wechat")
+    ap.add_argument("--manual", action="store_true",
+                    help="纯音频桥模式: 不做任何 UI 自动化(接听/挂断/自动切麦), "
+                         "任何 App 可零适配使用; 通话记录与知识库仍可用")
     ap.add_argument("--capture-idx", type=int, default=None,
                     help="捕获设备索引 (某个输出设备的 [Loopback] 伴侣)")
     ap.add_argument("--inject-idx", type=int, default=None,
@@ -955,9 +1013,22 @@ def main():
     ap.add_argument("--no-auto-answer", action="store_true",
                     help="关闭来电自动接听 (默认按 AUTO_ANSWER 配置开启)")
     args = ap.parse_args()
-    global AUTO_ANSWER
-    if args.no_auto_answer:
+
+    global AUTO_ANSWER, MANUAL_MODE, _active_cfg
+    MANUAL_MODE = bool(args.manual)
+    try:
+        _active_cfg = get_app(args.app)
+    except KeyError as e:
+        print(f"错误: {e}")
+        sys.exit(1)
+    if args.no_auto_answer or MANUAL_MODE:
         AUTO_ANSWER = False
+
+    mode_note = (f"[manual 纯音频桥]" if MANUAL_MODE
+                 else f"[{_active_cfg.display_name} + UI自动化]")
+    print(f"[BRIDGE] 模式: {mode_note}", flush=True)
+    if not MANUAL_MODE:
+        print(f"[BRIDGE] {_active_cfg.setup_hint}", flush=True)
 
     if not API_KEY:
         print("错误: 未配置 ALIYUN_REALTIME_API_KEY (检查 .env)")
@@ -972,7 +1043,7 @@ def main():
 
     wasapi_idx = _wasapi_index(pa)
 
-    # ---- 捕获设备: 微信扬声器(物理设备) 的 loopback ----
+    # ---- 捕获设备: 应用扬声器(物理设备) 的 loopback ----
     # 注意: 必须选【物理】输出设备的 loopback, 绝不能选 CABLE 的 loopback,
     #       否则 AI 注入 CABLE Input 的声音会被重新捕获, 形成自激回声。
     capture_idx = args.capture_idx
@@ -1013,10 +1084,16 @@ def main():
     down_q = queue.Queue(maxsize=PLAY_QUEUE_MAX)
     stop_event = threading.Event()
 
-    # 自动切换系统默认麦克风 -> CABLE Output (微信无持久设备设置, 跟随系统默认)
+    # 系统默认麦克风切换: 仅当该 App 跟随系统默认麦克风(微信)且非 manual 模式时执行。
+    # 钉钉/企微在应用内直接选设备, 无需切系统默认。
     mic_switch = DefaultMicSwitch()
-    if not args.no_default_mic:
+    need_default_mic = (not MANUAL_MODE and _active_cfg is not None
+                        and _active_cfg.mic_follows_system_default)
+    if need_default_mic and not args.no_default_mic:
         mic_switch.activate()
+    elif MANUAL_MODE:
+        print("[BRIDGE] manual 模式: 跳过系统默认麦克风切换, "
+              "请在应用内把麦克风选为 CABLE Output", flush=True)
 
     # 静音保活: 防止 loopback 在扬声器空闲时阻塞 (通话中对方停顿的致命场景)
     src_out = find_source_output_of_loopback(pa, capture_idx)
@@ -1051,25 +1128,31 @@ def main():
     )
     ws_t.start()
 
-    # ---- 来电自动接听 ----
+    # ---- 来电自动接听 (仅 UI 自动化模式) ----
     global _incoming_watcher
-    if AUTO_ANSWER:
+    if _call_recorder and _active_cfg is not None:
+        _call_recorder.app = _active_cfg.key  # 通话记录标注应用端
+    if AUTO_ANSWER and not MANUAL_MODE:
         def _on_incoming_answered(caller: str):
             # 接通 3 秒后若无人出声, 播种让 AI 先开口 (watch_stop 里消费)
             _shared["answer_seed_at"] = time.time() + 3.0
             _shared["answer_caller"] = caller or "对方"
             if _call_recorder:
                 _call_recorder.on_note(f"[来电] 自动接听: {caller or '未知'}")
+                _call_recorder.set_contact(caller)
         try:
             from autodial.incoming import IncomingWatcher
             _incoming_watcher = IncomingWatcher(
                 on_answered=_on_incoming_answered,
                 allow_video=AUTO_ANSWER_VIDEO,
                 poll_sec=AUTO_ANSWER_POLL,
+                app=_active_cfg,
             )
             _incoming_watcher.start()
         except Exception as e:  # noqa: BLE001
             print(f"[MAIN] 来电监听启动失败(不影响桥接): {e}", flush=True)
+    elif MANUAL_MODE:
+        print("[MAIN] manual 模式: 来电自动接听/AI挂断已禁用, 请手动接听与挂断", flush=True)
     else:
         print("[MAIN] 来电自动接听已关闭 (AUTO_ANSWER=0)", flush=True)
 

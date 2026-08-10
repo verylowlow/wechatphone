@@ -21,12 +21,15 @@ IDLE_END_SEC = 90  # 90s 无任何活动 -> 判定通话结束
 
 
 class CallRecorder:
-    def __init__(self, store: CallStore | None = None, on_call_closed=None):
+    def __init__(self, store: CallStore | None = None, on_call_closed=None,
+                 app: str = ""):
         self.store = store or CallStore()
         self.on_call_closed = on_call_closed  # 通话收尾时的回调 (如清理 autodial 任务文件)
+        self.app = app or ""                  # 当前服务的应用端 (wechat/dingtalk/wecom)
         self._lock = threading.Lock()
         self.call_id: str | None = None
         self.last_activity = 0.0
+        self.pending_contact = ""  # 通话开始前已知对端(如 autodial 外呼)时暂存
         # 累积本轮 AI 回复文本, 用于生成通话摘要
         self._ai_turns: list[str] = []
         self._remote_turns: list[str] = []
@@ -37,12 +40,27 @@ class CallRecorder:
         """Must be called with self._lock held. Returns active call_id."""
         if self.call_id is None:
             self.call_id = time.strftime("%Y%m%d-%H%M%S")
-            self.store.create_call(self.call_id)
+            self.store.create_call(self.call_id, app=self.app,
+                                   contact=self.pending_contact)
             self._ai_turns = []
             self._remote_turns = []
-            print(f"[CALLLOG] 通话开始: {self.call_id}", flush=True)
+            print(f"[CALLLOG] 通话开始: {self.call_id} "
+                  f"(app={self.app or '-'}, contact={self.pending_contact or '-'})", flush=True)
         self.last_activity = time.time()
         return self.call_id
+
+    def set_contact(self, contact: str) -> None:
+        """确定对端身份后回填 (来电自动接听识别主叫人 / 外呼任务注入联系人)。
+        通话尚未开始时暂存, 随 create_call 一并落库。"""
+        contact = (contact or "").strip()
+        if not contact or contact == "对方":
+            return
+        with self._lock:
+            if self.call_id is None:
+                self.pending_contact = contact
+                return
+            cid = self.call_id
+        self.store.update_call_meta(cid, contact=contact)
 
     def check_idle(self) -> None:
         """Close the call if idle too long. Call periodically (e.g. from watch loop)."""

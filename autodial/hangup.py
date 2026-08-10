@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Hang up the current WeChat voice call via UI automation.
+"""Hang up the current voice call via UI automation (app-agnostic, adapter-driven).
 
 Locate strategy:
-  1. UIA: any Button named 挂断/结束/结束通话 in any window (call bar / popup)
-  2. calibrated fallback: answer_offset-like "hangup_offset" relative to the
-     WeChat main window, or template image "hangup_template".
+  1. UIA: any Button matching cfg.hangup_button_names in any window (call bar / popup)
+  2. calibrated fallback: "hangup_offset" relative to the app main window,
+     or template image "hangup_template".
 
-Safety: hangup() re-checks the button still exists right before clicking —
+Safety: hang_up() re-checks the button still exists right before clicking —
 if the remote party already hung up, we skip the click (nothing to press).
 """
 from __future__ import annotations
@@ -14,34 +14,31 @@ from __future__ import annotations
 import os
 import time
 
-HANGUP_NAMES = ("挂断", "结束通话", "结束")
+from adapters.base import AppConfig, find_hangup_button, find_main_window
+from adapters import get_app, DEFAULT_APP
 
 
-def find_hangup_button():
-    """Returns (window, button) of the hangup control, or None."""
-    from pywinauto import Desktop
-    try:
-        windows = Desktop(backend="uia").windows()
-    except Exception:
-        return None
-    for w in windows:
-        try:
-            for b in w.descendants(control_type="Button"):
-                try:
-                    name = (b.window_text() or "").strip()
-                except Exception:
-                    continue
-                if name and any(k in name for k in HANGUP_NAMES):
-                    return w, b
-        except Exception:
-            continue
-    return None
-
-
-def hang_up() -> dict:
+def hang_up(app: str | AppConfig = DEFAULT_APP) -> dict:
     """Perform the hangup click. Returns {'ok': bool, 'method': str}."""
+    cfg = app if isinstance(app, AppConfig) else get_app(app)
+    # 0) 微信 4.1+ 视觉方案: 通话窗口大红圆
+    if cfg.ui_engine == "vision41":
+        try:
+            from autodial import wx41
+            return wx41.hang_up()
+        except Exception as e:  # noqa: BLE001
+            print(f"[HANGUP] vision41 异常: {e}", flush=True)
+            return {"ok": False, "method": "vision41_error"}
+    # 0b) 企业微信视觉方案: 通话界面大红圆, 回退 OCR 挂断文本
+    if cfg.ui_engine == "wecom_vision":
+        try:
+            from autodial import wecom_ui
+            return wecom_ui.hang_up()
+        except Exception as e:  # noqa: BLE001
+            print(f"[HANGUP] wecom 异常: {e}", flush=True)
+            return {"ok": False, "method": "wecom_error"}
     # 1) UIA
-    hit = find_hangup_button()
+    hit = find_hangup_button(cfg)
     if hit:
         _w, btn = hit
         try:
@@ -55,7 +52,7 @@ def hang_up() -> dict:
     # 2) 校准回退
     try:
         from autodial.taskfile import load_calib
-        calib = load_calib() or {}
+        calib = load_calib(cfg.key) or {}
         off = calib.get("hangup_offset")
         tmpl = calib.get("hangup_template")
         if tmpl and os.path.exists(tmpl):
@@ -66,20 +63,19 @@ def hang_up() -> dict:
                 pyautogui.click(c.x, c.y)
                 return {"ok": True, "method": "template"}
         if off:
-            from autodial.dialer import WeChatDialer
-            d = WeChatDialer.__new__(WeChatDialer)
-            win = d._find_wechat_window()
-            r = win.rectangle()
-            import pyautogui
-            pyautogui.click(int(r.left) + int(off["x"]), int(r.top) + int(off["y"]))
-            return {"ok": True, "method": "offset"}
+            win = find_main_window(cfg)
+            if win is not None:
+                r = win.rectangle()
+                import pyautogui
+                pyautogui.click(int(r.left) + int(off["x"]), int(r.top) + int(off["y"]))
+                return {"ok": True, "method": "offset"}
     except Exception as e:  # noqa: BLE001
         print(f"[HANGUP] 校准回退失败: {e}", flush=True)
     return {"ok": False, "method": "not_found"}
 
 
 def wait_audio_drain(down_queue, max_wait: float = 15.0) -> None:
-    """等播放队列清空 (确保 farewell 语音完整注入给微信), 最多等 max_wait 秒。"""
+    """等播放队列清空 (确保 farewell 语音完整注入给应用), 最多等 max_wait 秒。"""
     t0 = time.time()
     while time.time() - t0 < max_wait:
         try:

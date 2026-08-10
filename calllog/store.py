@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS calls (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     duration_sec INTEGER DEFAULT 0,
-    summary TEXT DEFAULT ''
+    summary TEXT DEFAULT '',
+    app TEXT DEFAULT '',
+    contact TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +38,12 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_call ON events(call_id);
 """
+
+# 旧库迁移: 补齐新增列 (SQLite 不支持 IF NOT EXISTS 语法, 手动探测)
+_MIGRATIONS = (
+    ("app", "ALTER TABLE calls ADD COLUMN app TEXT DEFAULT ''"),
+    ("contact", "ALTER TABLE calls ADD COLUMN contact TEXT DEFAULT ''"),
+)
 
 
 def _now() -> str:
@@ -50,16 +58,35 @@ class CallStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """旧版库补齐新增列 (app / contact)。"""
+        with self._lock:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(calls)")}
+            for name, stmt in _MIGRATIONS:
+                if name not in cols:
+                    self._conn.execute(stmt)
 
     # ---------- write ----------
 
-    def create_call(self, call_id: str) -> None:
+    def create_call(self, call_id: str, app: str = "", contact: str = "") -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO calls(call_id, started_at) VALUES(?, ?)",
-                (call_id, _now()),
+                "INSERT OR IGNORE INTO calls(call_id, started_at, app, contact) VALUES(?, ?, ?, ?)",
+                (call_id, _now(), app or "", contact or ""),
             )
+            self._conn.commit()
+
+    def update_call_meta(self, call_id: str, app: str | None = None,
+                         contact: str | None = None) -> None:
+        """通话开始后才确定 app/contact 时, 回填元信息。"""
+        with self._lock:
+            if app is not None:
+                self._conn.execute("UPDATE calls SET app=? WHERE call_id=?", (app, call_id))
+            if contact is not None:
+                self._conn.execute("UPDATE calls SET contact=? WHERE call_id=?", (contact, call_id))
             self._conn.commit()
 
     def end_call(self, call_id: str) -> None:

@@ -90,6 +90,8 @@ def index():
         rows.append(f"""
         <tr>
           <td><a href="/call/{c['call_id']}">{c['call_id']}</a></td>
+          <td>{c.get('app') or '-'}</td>
+          <td>{c.get('contact') or '-'}</td>
           <td>{c['started_at']}</td>
           <td>{fmt_duration(c['duration_sec'], ended=bool(c['ended_at']))}</td>
           <td>{c['event_count']}</td>
@@ -103,8 +105,8 @@ def index():
   <div class="stat"><div class="n">{done}</div><div class="muted">已结束</div></div>
   <div class="stat"><div class="n">{total_events}</div><div class="muted">事件总数</div></div>
 </div>
-<table><thead><tr><th>通话ID</th><th>开始时间</th><th>时长</th><th>事件数</th><th>摘要</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="5" class="muted">暂无通话记录。启动 bridge.py 打电话后, 记录会自动出现。</td></tr>'}</tbody></table>
+<table><thead><tr><th>通话ID</th><th>应用</th><th>联系人</th><th>开始时间</th><th>时长</th><th>事件数</th><th>摘要</th></tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="7" class="muted">暂无通话记录。启动 bridge.py 打电话后, 记录会自动出现。</td></tr>'}</tbody></table>
 </body></html>"""
 
 
@@ -139,7 +141,8 @@ def call_detail(call_id):
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>通话 {call_id} - wechatphone</title>{PAGE_CSS}</head><body>
 <h1><a href="/">通话记录</a> / {call_id}</h1>
-<div class="muted" style="margin-bottom:16px">开始 {call['started_at']} · 结束 {call['ended_at'] or '进行中'} ·
+<div class="muted" style="margin-bottom:16px">应用 {call.get('app') or '-'} · 联系人 {call.get('contact') or '-'} ·
+开始 {call['started_at']} · 结束 {call['ended_at'] or '进行中'} ·
 时长 {fmt_duration(call['duration_sec'], ended=bool(call['ended_at']))} · 摘要: {call['summary'] or '-'}</div>
 {''.join(items) or '<div class="muted">该通话暂无事件。</div>'}
 </body></html>"""
