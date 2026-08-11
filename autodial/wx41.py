@@ -160,9 +160,11 @@ def _ocr_lines(pil_img):
 
 # ---------------- color blob (hangup / answer circles) ----------------
 
-def _find_circle(full_img, kind: str):
+def _find_circle(full_img, kind: str, min_area: int | None = None):
     """在全屏截图里找大圆按钮。kind='red'(挂断) / 'green'(接听)。
+    min_area 缺省 MIN_CIRCLE_AREA (微信4.1 大圆); 钉钉小面板红圆更小, 传更小值。
     返回屏幕坐标 (cx, cy) 或 None。"""
+    need = min_area if min_area is not None else MIN_CIRCLE_AREA
     a = np.array(full_img.convert("RGB")).astype(int)
     r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
     if kind == "red":
@@ -176,7 +178,7 @@ def _find_circle(full_img, kind: str):
         area = stats[i, cv2.CC_STAT_AREA]
         w = stats[i, cv2.CC_STAT_WIDTH]
         hh = stats[i, cv2.CC_STAT_HEIGHT]
-        if area >= MIN_CIRCLE_AREA and 0.8 <= w / max(1, hh) <= 1.25:
+        if area >= need and 0.8 <= w / max(1, hh) <= 1.25:
             if best is None or area > best[2]:
                 best = (int(cents[i][0]), int(cents[i][1]), int(area))
     return (best[0], best[1]) if best else None

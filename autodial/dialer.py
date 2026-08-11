@@ -33,7 +33,7 @@ class AppDialer:
         self.dry_run = dry_run
         self.cfg = app if isinstance(app, AppConfig) else get_app(app)
         self.calib = load_calib(self.cfg.key)
-        if self.cfg.ui_engine in ("vision41", "wecom_vision"):
+        if self.cfg.ui_engine in ("vision41", "wecom_vision", "dingtalk_vision"):
             return  # 视觉方案无需校准
         if self.calib is None or not self.calib.get("calibrated_at"):
             raise DialError(
@@ -77,6 +77,8 @@ class AppDialer:
 
         if self.cfg.ui_engine == "wecom_vision":
             return self._dial_wecom_vision(contact)
+        if self.cfg.ui_engine == "dingtalk_vision":
+            return self._dial_dingtalk_vision(contact)
         if self.cfg.ui_engine == "vision41":
             return self._dial_vision41(contact)
 
@@ -170,6 +172,33 @@ class AppDialer:
         info = wecom_ui.start_voice_call()
         print(f"[AUTODIAL] 已向 {contact} 发起语音通话 (wecom_vision)", flush=True)
         return {"contact": contact, "clicked": "wecom_vision", "info": info,
+                "dry_run": False}
+
+    # ---------- dingtalk_vision (钉钉 视觉拨号) ----------
+
+    def _dial_dingtalk_vision(self, contact: str) -> dict:
+        """2026-08-10 实测流程: 通讯录(UIA)→搜索清除+精确→联系人tab→
+        首条行尾语音图标→小通话面板。"""
+        from autodial import dingtalk_ui
+        if self.dry_run:
+            print(f"[AUTODIAL] (dry-run) dingtalk 预演: 通讯录→搜索 {contact} "
+                  f"→联系人tab→行尾语音图标", flush=True)
+            return {"contact": contact, "clicked": None, "dry_run": True}
+        print(f"[AUTODIAL] dingtalk: 激活钉钉, 进入通讯录...", flush=True)
+        dingtalk_ui.open_contacts()
+        print(f"[AUTODIAL] dingtalk: 清除并精确搜索 {contact} + 联系人tab", flush=True)
+        try:
+            hits = dingtalk_ui.search_contact(contact)
+        except dingtalk_ui.DuplicateContactError as e:
+            self._log_duplicate(str(e), contact)
+            raise DialError(str(e))
+        if not hits:
+            raise DialError(f"通讯录搜索无命中记录: {contact}")
+        info = dingtalk_ui.start_voice_call(hits)
+        if not info.get("call_up"):
+            raise DialError("点击语音通话后未检测到通话面板")
+        print(f"[AUTODIAL] 已向 {contact} 发起语音通话 (dingtalk_vision)", flush=True)
+        return {"contact": contact, "clicked": "dingtalk_vision", "info": info,
                 "dry_run": False}
 
     def _log_duplicate(self, msg: str, contact: str) -> None:

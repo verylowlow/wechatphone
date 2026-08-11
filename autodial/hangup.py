@@ -37,6 +37,14 @@ def hang_up(app: str | AppConfig = DEFAULT_APP) -> dict:
         except Exception as e:  # noqa: BLE001
             print(f"[HANGUP] wecom 异常: {e}", flush=True)
             return {"ok": False, "method": "wecom_error"}
+    # 0c) 钉钉视觉方案: OCR"挂断"上方红圆, 回退红连通域
+    if cfg.ui_engine == "dingtalk_vision":
+        try:
+            from autodial import dingtalk_ui
+            return dingtalk_ui.hang_up()
+        except Exception as e:  # noqa: BLE001
+            print(f"[HANGUP] dingtalk 异常: {e}", flush=True)
+            return {"ok": False, "method": "dingtalk_error"}
     # 1) UIA
     hit = find_hangup_button(cfg)
     if hit:
