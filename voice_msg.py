@@ -33,9 +33,11 @@
   项目根目录 sendvoice.cmd 可任意目录调用:  sendvoice 小芳 "D:/a.silk"
 
 .env 配置:
-  TTS_ENGINE=volc          主引擎: volc (火山方舟 Seed TTS) / edge (免费, 无需 key)
+  TTS_ENGINE=volc          主引擎: volc (豆包 Seed TTS 原生接口) / edge (免费, 无需 key)
   TTS_FALLBACK_ENABLED=1   volc 失败时自动降级 edge
   TTS_API_KEY / TTS_BASE_URL / TTS_MODEL / TTS_VOICE / TTS_SPEED / TTS_TIMEOUT
+    注: 原生接口鉴权用 X-Api-Key 头 (非 Bearer); TTS_MODEL 即 X-Api-Resource-Id,
+    uranus(2.0)音色须配 seed-tts-2.0, 详见 test_doubao_tts.py
   TTS_EDGE_VOICE=zh-CN-XiaoxiaoNeural   edge 音色 (可 --list-voices 查询)
   VOICE_REC_START_MS=250   开录音后多少毫秒开始播放
   VOICE_TAIL_MS=250        播完后多少毫秒点发送
@@ -92,9 +94,11 @@ TTS_ENGINE = os.environ.get("TTS_ENGINE", "volc").strip().lower()
 TTS_FALLBACK_ENABLED = os.environ.get("TTS_FALLBACK_ENABLED", "1") == "1"
 TTS_API_KEY = os.environ.get("TTS_API_KEY", "")
 TTS_BASE_URL = os.environ.get(
-    "TTS_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3/audio/speech")
-TTS_MODEL = os.environ.get("TTS_MODEL", "doubao-seed-tts-2.0-250115")
-TTS_VOICE = os.environ.get("TTS_VOICE", "zh_female_jiaochuan_mars_bigtts")
+    "TTS_BASE_URL", "https://openspeech.bytedance.com/api/v3/tts/unidirectional")
+# TTS_MODEL = X-Api-Resource-Id: uranus 2.0音色配 seed-tts-2.0,
+# mars/moon 1.0音色配 seed-tts-1.0, 复刻音色(S_开头)配 seed-icl-2.0
+TTS_MODEL = os.environ.get("TTS_MODEL", "seed-tts-2.0")
+TTS_VOICE = os.environ.get("TTS_VOICE", "zh_female_jiaochuannv_uranus_bigtts")
 TTS_EDGE_VOICE = os.environ.get("TTS_EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
 TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
 TTS_TIMEOUT = float(os.environ.get("TTS_TIMEOUT", "30"))
@@ -181,52 +185,84 @@ class TTSError(Exception):
 
 
 def _tts_volc(text: str) -> str:
-    """火山方舟 Seed TTS -> WAV 文件路径。失败抛 TTSError。
+    """豆包 Seed TTS 原生接口 -> WAV 文件路径。失败抛 TTSError。
 
-    OpenAI 兼容接口: POST {TTS_BASE_URL}
-      body: {"model", "input", "voice", "response_format", "speed"}
-      返回: 二进制音频 (audio/*) 或 JSON {"data": base64}
+    POST {TTS_BASE_URL} (https://openspeech.bytedance.com/api/v3/tts/unidirectional)
+      鉴权头 (新版控制台, 非 Bearer):
+        X-Api-Key           = TTS_API_KEY
+        X-Api-Resource-Id   = TTS_MODEL (uranus音色须 seed-tts-2.0;
+                              mars/moon 1.0音色用 seed-tts-1.0; 复刻S_用 seed-icl-2.0)
+        X-Api-Request-Id    = uuid
+      body: {"user":{"uid"}, "req_params":{"text","speaker","audio_params"}}
+      返回: NDJSON 流, 每行一个 JSON:
+        {"code":0,"data":"<base64 pcm 片段>"}  拼接
+        {"code":20000000,...}                  合成结束
+        其他 code                              错误 (45000000=音色未授权等)
+    音频按 pcm 请求, 本地补 WAV 头落盘 (流式 wav 会重复 header, 官方建议 pcm)。
     """
     import base64
+    import json
+    import struct
+    import uuid
     import requests
     if not TTS_ENABLED:
         raise TTSError("TTS 未启用 (TTS_ENABLED=0)")
     if not TTS_API_KEY:
         raise TTSError("未配置 TTS_API_KEY (.env)")
+
+    rate = 24000
+    audio_params = {"format": "pcm", "sample_rate": rate}
+    speech_rate = int(round((TTS_SPEED - 1.0) * 100))   # 100=2倍速, -50=0.5倍速
+    if speech_rate:
+        audio_params["speech_rate"] = max(-50, min(100, speech_rate))
     payload = {
-        "model": TTS_MODEL,
-        "input": text,
-        "voice": TTS_VOICE,
-        "response_format": "wav",
-        "speed": TTS_SPEED,
+        "user": {"uid": "wechatphone"},
+        "req_params": {
+            "text": text,
+            "speaker": TTS_VOICE,
+            "audio_params": audio_params,
+        },
     }
-    headers = {"Authorization": f"Bearer {TTS_API_KEY}",
-               "Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": TTS_API_KEY,
+        "X-Api-Resource-Id": TTS_MODEL,
+        "X-Api-Request-Id": str(uuid.uuid4()),
+    }
     try:
         resp = requests.post(TTS_BASE_URL, json=payload, headers=headers,
-                             timeout=TTS_TIMEOUT)
+                             timeout=TTS_TIMEOUT, stream=True)
     except Exception as e:  # noqa: BLE001
         raise TTSError(f"TTS 请求失败 ({type(e).__name__}): {e}") from e
-    if resp.status_code >= 400:
-        raise TTSError(f"TTS HTTP {resp.status_code}: {resp.text[:300]}")
 
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    if "json" in ctype:
-        # 兼容 JSON 包裹 base64 的返回
-        try:
-            data = resp.json()
-        except Exception as e:  # noqa: BLE001
-            raise TTSError(f"TTS 返回非 JSON: {e}") from e
-        b64 = data.get("data") or (data.get("output") or {}).get("audio")
-        if not b64:
-            raise TTSError(f"TTS 返回无音频: {str(data)[:300]}")
-        audio = base64.b64decode(b64)
-    else:
-        audio = resp.content
-    if not audio or len(audio) < 100:
+    try:
+        if resp.status_code >= 400:
+            raise TTSError(f"TTS HTTP {resp.status_code}: {resp.text[:300]}")
+        chunks = []
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception as e:  # noqa: BLE001
+                raise TTSError(f"TTS 响应非 JSON: {raw[:200]}") from e
+            code = obj.get("code")
+            if code == 0 and obj.get("data"):
+                chunks.append(base64.b64decode(obj["data"]))
+            elif code == 20000000:
+                break
+            elif code is not None and code != 0:
+                raise TTSError(f"TTS 错误 code={code}: {obj.get('message')}")
+    finally:
+        resp.close()
+
+    pcm = b"".join(chunks)
+    if len(pcm) < 100:
         raise TTSError("TTS 返回音频为空")
-
-    return _save_tts_out(audio, ".wav")
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt "
+           + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+           + b"data" + struct.pack("<I", len(pcm)))
+    return _save_tts_out(hdr + pcm, ".wav")
 
 
 def _save_tts_out(audio: bytes, ext: str) -> str:
