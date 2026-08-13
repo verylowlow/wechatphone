@@ -14,3 +14,4 @@ pyperclip
 pillow
 opencv-python-headless
 rapidocr-onnxruntime
+edge-tts

@@ -286,6 +286,53 @@ AUTO_ANSWER_VIDEO=0      # 只接语音 (推荐)
 AUTO_ANSWER_POLL=1.0
 ```
 
+## 语音消息模块 (模块4: voice_msg / sendvoice)
+
+给指定联系人**发送语音条** (不是语音通话)。2026-08-12 实测通过 @ 微信 4.1:
+微信语音消息是"本地录音→自行编码上传", 录音吃**系统默认麦克风**——
+切默认麦到 CABLE Output 再往 CABLE Input 播音频即可, **全程不需要转 silk**。
+
+- **四种输入**: 文本(TTS 合成) / .wav / .silk(微信语音, silk-wasm 解码) / .mp3 等(ffmpeg 解码)
+- **TTS 双引擎**: 主引擎 volc 豆包 Seed TTS (HTTP); 失败自动降级 **edge-tts 免费兜底** (无需 key, `TTS_FALLBACK_ENABLED=0` 可关)
+- **铁律**: 音频准备(TTS/解码)失败直接报错退出, **绝不触碰微信**
+- **安全**: OCR 分区定位联系人 + 会话标题校验, 防误发; >60s 拒发(微信上限)
+- **时序**: 切麦 → 点绿色语音按钮(发送键左侧) → 等 250ms 播音频 → 播完等 250ms → 点绿箭头发送
+
+> 易混淆: 输入区工具栏中部话筒图标是"语音输入法"(ASR转文字), Ctrl+Win 是全局语音转文字, 都**不是**发语音条。
+
+### 使用
+
+> 提示: 项目目录已加入用户 PATH, **新开的**终端窗口可直接敲 `sendvoice`;
+> 当前旧窗口 PowerShell 不搜当前目录, 需写 `.\sendvoice ...`。
+
+```bash
+# 项目根目录 sendvoice.cmd 可任意目录调用:
+sendvoice 小芳 "D:/a.silk"                    # 发 silk
+sendvoice 小芳 "D:/a.mp3"                     # 发 mp3
+sendvoice 小芳 --text "明天上午十点开会"        # 文本 -> Seed TTS -> 语音条
+sendvoice 小芳 "D:/a.wav" --dry-run           # 只准备音频不操作微信
+
+# 模块内使用:
+from voice_msg import send_voice_msg
+send_voice_msg("小芳", source="D:/a.silk")
+send_voice_msg("小芳", text="明天上午十点开会")
+```
+
+### 配置 (.env)
+| 变量 | 说明 |
+|---|---|
+| `TTS_ENGINE` | 主引擎: `volc` (默认) / `edge` (直接用免费引擎) |
+| `TTS_FALLBACK_ENABLED` | volc 失败自动降级 edge (默认 1, 设 0 关闭) |
+| `TTS_EDGE_VOICE` | edge 音色, 默认 `zh-CN-XiaoxiaoNeural` (`sendvoice --list-voices` 查全部) |
+| `TTS_ENABLED` / `TTS_TIMEOUT` | Seed TTS 开关 / HTTP 超时秒 |
+| `TTS_API_KEY` / `TTS_BASE_URL` | 火山方舟 key / OpenAI 兼容 speech 端点 |
+| `TTS_MODEL` / `TTS_VOICE` / `TTS_SPEED` | 模型 / 音色 / 语速 |
+| `VOICE_REC_START_MS` / `VOICE_TAIL_MS` | 开录音后延迟播 / 播完延迟发送 (毫秒, 默认 250/250, 调参用) |
+| `FFMPEG_PATH` / `SILK_NODE_EXE` / `SILK_NODE_MODULES` | 外部工具路径 (一般自动检测无需改) |
+
+依赖: silk 解码需 node 环境装 `silk-wasm` (已装在托管 node workspace,
+`tools/silk_decode.js` 自动调用); mp3 等需 ffmpeg (`D:\programes\ffmpeg` 已就绪)。
+
 ## 已知限制 (原型阶段)
 
 - 重采样是线性插值, 音质够用但不完美; 追求音质可换 `soxr`。
